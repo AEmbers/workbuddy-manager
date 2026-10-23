@@ -163,13 +163,41 @@ if (-not $python) {
 
 # 5. 依赖健全性检查：关键包缺了就补装（预置运行时被破坏、依赖未装全等）
 if ($python) {
-    & $python -c "import fastapi, uvicorn" 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    $previousEap = $ErrorActionPreference
+    try {
+        # Native stderr becomes a terminating NativeCommandError under Stop,
+        # before redirection and the LASTEXITCODE repair branch can run.
+        $ErrorActionPreference = 'Continue'
+        $importLog = & $python -c "import fastapi, uvicorn" 2>&1 | Out-String
+        $importCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousEap
+    }
+    if ($importCode -ne 0) {
         Write-Host "[INIT] 检测到 Python 依赖不完整，正在安装 requirements.txt ..." -ForegroundColor Yellow
+        if ($importLog.Trim()) {
+            Write-Host "[WARN] 导入失败详情：" -ForegroundColor Yellow
+            Write-Host $importLog
+            Write-Host "[HINT] 若路径中出现 AppData\Roaming\Python\...\site-packages，" -ForegroundColor Yellow
+            Write-Host "       说明用户级 Python 包遮盖了内置运行时；脚本已用 PYTHONNOUSERSITE=1 隔离。" -ForegroundColor Yellow
+        }
         $reqFile = Join-Path $root 'server\requirements.txt'
         $uvExe = Join-Path $root '.tools\uv\uv.exe'
         if (Test-Path $uvExe) { & $uvExe pip install -r $reqFile --python $python }
         else { & $python -m pip install -r $reqFile }
+
+        $previousEap = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $verifyLog = & $python -c "import fastapi, uvicorn" 2>&1 | Out-String
+            $verifyCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $previousEap
+        }
+        if ($verifyCode -ne 0) {
+            Write-Host $verifyLog
+            throw "[ERROR] Python 依赖修复后仍无法导入，请查看上方错误信息。"
+        }
     }
 }
 

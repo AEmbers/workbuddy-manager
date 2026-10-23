@@ -1,0 +1,360 @@
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index 9e9c871..9351169 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -11,6 +11,7 @@ import (
+ 	"log"
+ 	"net/http"
+ 	"os"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -60,6 +61,10 @@ type Config struct {
+ // 故固定 60s 防雪崩即可，不随 soft_rate 配置、也不参与软退避指数。
+ const notFoundCooldown = 60 * time.Second
+ 
++// imagePromptBudgetCeiling 图片输入相关的 11115 上限判定边界。上限在此范围内
++// （实测常见 100k）时按请求级图片预算处理，不换号；高于此值仍可能是账号级 cap。
++const imagePromptBudgetCeiling int64 = 200_000
++
+ // wafCooldownBase WAF 403 软冷却基数（任务书 P0-1 建议 60s 起；抖动 ±25% 后落
+ // [45s,75s]，实际进入 CooldownSoftRate 后再按 softStreak 指数、封顶 soft_rate_max）。
+ // 与 SoftCooldown 分流的原因：WAF 403 是 IP/指纹维频控（WAF 403 报告 §6），信号比
+@@ -540,6 +545,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 
+ 	tried := map[string]bool{}
+ 	var lastErr error
++	// accountCapPTL 记录本轮是否因「账号级上下文上限」换过号：换号途中若已无可用
++	// 账号，末端按原语义回 400 prompt_too_long，绝不降级成 503 no_healthy_account
++	// （那会把"请求太长"误导成"网关没号"）。
++	var accountCapPTL bool
++	var accountCapBody, accountCapHint string
+ 
+ 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
+ 	// 按模型解析：同一个会话可能换模型，绑定号若在当前模型上被 6004 限额（对其他模型
+@@ -693,6 +703,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+ 		}
+ 		if acct == nil {
++			// 本轮曾因「账号级上下文上限」换过号，但已无别的号可试：按原语义回 400。
++			if accountCapPTL {
++				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(accountCapBody), accountCapHint)
++				st.status = http.StatusBadRequest
++				return
++			}
+ 			st.status = http.StatusServiceUnavailable
+ 			break
+ 		}
+@@ -812,18 +828,48 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+ 				st.status = http.StatusBadRequest
+ 				return
+ 			}
+-			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
+-			// ——上下文超限是请求的问题（同一 body 换任何号都超限，白扔健康号配额；
+-			// 与 WAF IP fail-fast 同哲学：确定与账号无关的错误直接终止轮转）。
+-			// applyErrorPolicy ErrPromptTooLong 分支零动作（不冷却/不熔断/不 NoteError，
+-			// 不喂连败），fail 只释放租约。error-passthrough：message 装上游 body 原文
+-			// （code/msg/requestId 原样，含真实 token 数与上限值——上游原文是最有价值
+-			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
++			// 11115「prompt is too long」：先辨成因，别一律当成"请求的问题"。
++			//   - maximum ≈ 模型目录上下文（真超限）：同一 body 换任何号都超限 → 立即透传
++			//     原文、不轮转（与 WAF IP fail-fast 同哲学：确定与账号无关的错误终止轮转）。
++			//   - 纯文本请求的 maximum **明显小于**模型目录上下文：这个天花板是**接单账号/
++			//     路由自己**临时给的，不是模型上限（本机实测：同一池另一个号上 500k tokens
++			//     正常返回 200），换号仍有成功机会 → 解绑粘性 + 释放租约后换号重试。不修
++			//     这一条，客户端的压缩（compaction）请求会把整段历史发上去、反复撞同一个被
++			//     钉住的号，对外表现就是"压缩已中断"死锁（codex thread 卡死事故的根因）。
++			//   - 带图且 maximum <= 200k：图片输入另有更小的上游准入预算（常见 100k），
++			//     它随请求图片固定存在，不随接单账号改变；换号只会重复撞同一预算。直接按
++			//     原语义透传 400 prompt_too_long，由客户端压图后重试。带图请求若报 500k
++			//     等明显高于图片预算的上限，仍可能是账号级 cap，保留换号机会。
++			// applyErrorPolicy ErrPromptTooLong 分支零动作（不冷却/不熔断/不 NoteError，不喂连败），
++			// fail 只释放租约（失败号是粘性号时顺带解绑）。error-passthrough：message 装上游 body
++			// 原文（code/msg/requestId 原样，含真实 token 数与上限值——上游原文是最有价值的错误
++			// 信息，客户端必须看到，禁止固定词覆盖）。
+ 			if kind == upstream.ErrPromptTooLong {
+-				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
++				ptlBody := string(respBody)
++				ptlHint := h.hintOf(upstream.ErrPromptTooLong, ptlBody, bareModel, reqHasImage, uerr)
++				if maxTok, ok := parsePromptMaxTokens(ptlBody); ok && maxTok > 0 &&
++					maxTok < upstream.ContextWindowListing(bareModel, 0) &&
++					(!reqHasImage || maxTok > imagePromptBudgetCeiling) &&
++					i+1 < h.cfg.MaxRotate &&
++					hasOtherAvailableUID(h.cfg.Pool.AvailableUIDsForModelRealm(bareModel, realm), tried) {
++					// 账号级天花板：不罚号（applyErrorPolicy 零动作），只换号重试。
++					h.applyErrorPolicy(acct.UID, kind, ptlBody, bareModel, uerr)
++					accountCapPTL = true
++					accountCapBody, accountCapHint = ptlBody, ptlHint
++					log.Printf("WARN: [server] prompt_too_long by account-level cap=%d (< model window %d) acct=%s, rotate to another account",
++						maxTok, upstream.ContextWindowListing(bareModel, 0), acct.Nickname)
++					fail(acct.UID)
++					if rotateBackoff(i, r.Context()) {
++						continue
++					}
++					// 客户端已断连：换号无意义，按原语义透传 400 后退出。
++					writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(ptlBody), ptlHint)
++					st.status = http.StatusBadRequest
++					return
++				}
++				h.applyErrorPolicy(acct.UID, kind, ptlBody, bareModel, uerr)
+ 				fail(acct.UID)
+-				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
+-					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
++				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(ptlBody), ptlHint)
+ 				st.status = http.StatusBadRequest
+ 				return
+ 			}
+@@ -1023,6 +1069,44 @@ func promptTooLongMessage(body string) string {
+ 	return body
+ }
+ 
++// parsePromptMaxTokens 从 11115 原文里取"上报的最大 token 数"（"100001 tokens
++// \u003e 100000 maximum" 里的 100000），取不到返回 ok=false（调用方按真超限处理，
++// 不轮转）。不用正则：原文是 JSON，'>' 可能被转义成 \u003e（转义串里还带数字 003）
++// 甚至双重转义，所以取 maximum 前紧邻的那段连续数字，别把转义里的数位算进去。
++func parsePromptMaxTokens(body string) (int64, bool) {
++	j := strings.Index(body, " maximum")
++	if j < 0 {
++		return 0, false
++	}
++	end := j
++	for end > 0 && body[end-1] == ' ' {
++		end--
++	}
++	k := end
++	for k > 0 && body[k-1] >= '0' && body[k-1] <= '9' {
++		k--
++	}
++	if k == end {
++		return 0, false
++	}
++	v, err := strconv.ParseInt(body[k:end], 10, 64)
++	if err != nil {
++		return 0, false
++	}
++	return v, true
++}
++
++// hasOtherAvailableUID 判断可用号集合里是否还有本轮没试过的号（tried 已含当前
++// 失败号）——换号前先确认"还有别的号可试"，避免把 400 变成 503。
++func hasOtherAvailableUID(uids []string, tried map[string]bool) bool {
++	for _, uid := range uids {
++		if !tried[uid] {
++			return true
++		}
++	}
++	return false
++}
++
+ // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2，报告 §6）：
+ // 第 i 次轮转失败（continue 换号前）等待 backoffAfter(i)（500ms·2^i 封顶 8s，
+ // ±25% 抖动），ctx 取消（客户端断连/优雅停机）返回 false——调用方立即终止轮转
+diff --git a/internal/server/handler_prompt_too_long_test.go b/internal/server/handler_prompt_too_long_test.go
+index 67560a1..49ac10f 100644
+--- a/internal/server/handler_prompt_too_long_test.go
++++ b/internal/server/handler_prompt_too_long_test.go
+@@ -14,12 +14,12 @@ import (
+ // ptl-passthrough-restore：只恢复透传语义，无出站预估——用户裁定移除预估拦截）：
+ // 上游真实 11115 → 分类不罚号不轮转、透传原文（非固定文案）；空 body → 兜底短文案。
+ 
+-// TestChatPromptTooLongPassesThroughUpstreamBody 上游 400 + 11115（含真实 token
+-// 数/上限值/requestId 原文）→ 不轮转（多账号池 calls=1，换号同样超限白扔配额）、
+-// 不罚号（无冷却/禁用/熔断计数）、error.message 逐字透传上游原文（上游原文是
+-// 最有价值的错误信息，客户端必须看到，禁止固定词覆盖）。
++// TestChatPromptTooLongPassesThroughUpstreamBody 真超限（上游报的 maximum 等于
++// 模型目录窗口，此处 glm-5.2 = 1M）→ 不轮转（多账号池 calls=1，换号同样超限白扔
++// 配额）、不罚号（无冷却/禁用/熔断计数）、error.message 逐字透传上游原文（上游
++// 原文是最有价值的错误信息，客户端必须看到，禁止固定词覆盖）。
+ func TestChatPromptTooLongPassesThroughUpstreamBody(t *testing.T) {
+-	const raw = `{"code":11115,"msg":"prompt is too long: 120000 tokens > 65536 maximum","requestId":"req-11115-abc"}`
++	const raw = `{"code":11115,"msg":"prompt is too long: 1000001 tokens > 1000000 maximum","requestId":"req-11115-abc"}`
+ 	calls := map[string]int{}
+ 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+ 		calls[authz]++
+@@ -53,15 +53,15 @@ func TestChatPromptTooLongPassesThroughUpstreamBody(t *testing.T) {
+ 	if e.Error.Message != raw {
+ 		t.Errorf("message=%q want raw upstream body passthrough %q", e.Error.Message, raw)
+ 	}
+-	if !strings.Contains(e.Error.Message, "120000 tokens > 65536 maximum") || !strings.Contains(e.Error.Message, "req-11115-abc") {
++	if !strings.Contains(e.Error.Message, "1000001 tokens > 1000000 maximum") || !strings.Contains(e.Error.Message, "req-11115-abc") {
+ 		t.Errorf("message must preserve real token count/limit/requestId: %s", e.Error.Message)
+ 	}
+ 	if strings.Contains(e.Error.Message, "all accounts are temporarily unavailable") {
+ 		t.Errorf("message must NOT be the fixed local scheduling text: %s", e.Error.Message)
+ 	}
+-	// 不轮转：多账号池也只打第一个号（换号同样超限，白扔配额）。
++	// 不轮转：多账号池也只打第一个号（真超限换号同样超限，白扔配额）。
+ 	if calls["Bearer at1"]+calls["Bearer at2"] != 1 {
+-		t.Errorf("upstream calls=%v want exactly 1 (no rotation on 11115)", calls)
++		t.Errorf("upstream calls=%v want exactly 1 (no rotation on genuine over-limit)", calls)
+ 	}
+ 	// 不罚号：a1 无冷却/无禁用/无熔断/无连败计数。
+ 	st, _ := p.Status("a1")
+@@ -70,6 +70,140 @@ func TestChatPromptTooLongPassesThroughUpstreamBody(t *testing.T) {
+ 	}
+ }
+ 
++// TestChatPromptTooLongAccountCapRotatesToAnotherAccount 账号级天花板（上游报的
++// maximum 远小于模型目录窗口：100000 vs glm-5.2 的 1M）→ 这个号只是"它自己被
++// 上游临时压低了上限"，不是请求真超限 → 换号重试，第二个号 200，请求最终成功。
++// 这是 codex「压缩已中断」死锁的回归用例：同一 thread 被会话粘性钉在低上限号上，
++// 压缩请求（把整段历史发上去做摘要）反复撞同一个 400，客户端就再也压不动了。
++func TestChatPromptTooLongAccountCapRotatesToAnotherAccount(t *testing.T) {
++	const raw = `{"code":11115,"msg":"prompt is too long: 100001 tokens \u003e 100000 maximum","requestId":"req-cap"}`
++	calls := map[string]int{}
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		calls[authz]++
++		if authz == "Bearer at-cap" {
++			return http.StatusBadRequest, raw, false
++		}
++		return http.StatusOK, sseOK, true
++	})
++	p := testPoolWith(
++		&auth.Auth{UID: "cap", AccessToken: "at-cap", ExpiresAt: 9999999999},
++		&auth.Auth{UID: "wide", AccessToken: "at-wide", ExpiresAt: 9999999999},
++	)
++	h := NewHandler(Config{Pool: p, Upstream: up})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
++	if rec.Code != http.StatusOK {
++		t.Fatalf("code=%d body=%s want 200 (rotate when the cap is account-level)", rec.Code, rec.Body)
++	}
++	if calls["Bearer at-cap"] != 1 || calls["Bearer at-wide"] != 1 {
++		t.Fatalf("calls=%v want cap:1 wide:1 (rotate exactly once)", calls)
++	}
++	// 账号级上限不是账号故障：不冷却/不禁用。
++	if st, _ := p.Status("cap"); st.Cooling || st.Disabled || st.ErrTotal != 0 {
++		t.Errorf("account-level cap must not penalize the account: %+v", st)
++	}
++}
++
++// TestChatPromptTooLongImageBudgetDoesNotRotate 带图请求撞上图片输入预算时不能按
++// 账号级 cap 换号：图片随请求固定在 body 里，换号不会改变上游对图片预算的判定。
++// 多账号池也只调用一次，透传上游 400，且不惩罚任何账号。
++func TestChatPromptTooLongImageBudgetDoesNotRotate(t *testing.T) {
++	const raw = `{"code":11115,"msg":"prompt is too long: 100001 tokens \u003e 100000 maximum","requestId":"req-image-cap"}`
++	calls := map[string]int{}
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		calls[authz]++
++		return http.StatusBadRequest, raw, false
++	})
++	p := testPoolWith(
++		&auth.Auth{UID: "img-cap-1", AccessToken: "at-img-cap-1", ExpiresAt: 9999999999},
++		&auth.Auth{UID: "img-cap-2", AccessToken: "at-img-cap-2", ExpiresAt: 9999999999},
++	)
++	h := NewHandler(Config{Pool: p, Upstream: up})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"cn:deepseek-v4.1-flash","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]}]}`)))
++
++	if rec.Code != http.StatusBadRequest {
++		t.Fatalf("code=%d body=%s want 400", rec.Code, rec.Body)
++	}
++	var e struct {
++		Error struct {
++			Code    string `json:"code"`
++			Message string `json:"message"`
++		} `json:"error"`
++	}
++	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
++		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
++	}
++	if e.Error.Code != "prompt_too_long" || e.Error.Message != raw {
++		t.Errorf("error=%+v want prompt_too_long with raw upstream body %q", e.Error, raw)
++	}
++	if calls["Bearer at-img-cap-1"]+calls["Bearer at-img-cap-2"] != 1 {
++		t.Errorf("upstream calls=%v want exactly 1 (image budget does not rotate)", calls)
++	}
++	for _, uid := range []string{"img-cap-1", "img-cap-2"} {
++		st, _ := p.Status(uid)
++		if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
++			t.Errorf("%s must not be penalized for an image-budget error: %+v", uid, st)
++		}
++	}
++}
++
++// TestChatPromptTooLongImageAccountCapStillRotates 带图请求的 maximum 高达 500k
++// 时，明显高于图片输入预算，仍可能是接单账号自身的上下文 cap；应保留普通账号级
++// cap 的换号机会，并由宽上限账号完成请求。
++func TestChatPromptTooLongImageAccountCapStillRotates(t *testing.T) {
++	const raw = `{"code":11115,"msg":"prompt is too long: 500001 tokens \u003e 500000 maximum","requestId":"req-image-account-cap"}`
++	calls := map[string]int{}
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		calls[authz]++
++		if authz == "Bearer at-img-cap-500k" {
++			return http.StatusBadRequest, raw, false
++		}
++		return http.StatusOK, sseOK, true
++	})
++	p := testPoolWith(
++		&auth.Auth{UID: "img-cap-500k", AccessToken: "at-img-cap-500k", ExpiresAt: 9999999999},
++		&auth.Auth{UID: "img-wide", AccessToken: "at-img-wide", ExpiresAt: 9999999999},
++	)
++	h := NewHandler(Config{Pool: p, Upstream: up})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
++		strings.NewReader(`{"model":"cn:deepseek-v4.1-flash","stream":true,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD"}}]}]}`)))
++
++	if rec.Code != http.StatusOK {
++		t.Fatalf("code=%d body=%s want 200 after rotating image request with 500k account cap", rec.Code, rec.Body)
++	}
++	if calls["Bearer at-img-cap-500k"] != 1 || calls["Bearer at-img-wide"] != 1 {
++		t.Fatalf("calls=%v want img-cap-500k:1 img-wide:1 (rotate exactly once)", calls)
++	}
++	if st, _ := p.Status("img-cap-500k"); st.Cooling || st.Disabled || st.ErrTotal != 0 {
++		t.Errorf("500k account-level cap must not penalize the account: %+v", st)
++	}
++}
++
++// TestChatPromptTooLongAccountCapNoOtherAccountStill400 账号级天花板但池里只有
++// 一个号：换号无号可换时按原语义透传 400，绝不能降级成 503 no_healthy_account
++// （那会把"请求太长"误导成"网关没号"）。
++func TestChatPromptTooLongAccountCapNoOtherAccountStill400(t *testing.T) {
++	const raw = `{"code":11115,"msg":"prompt is too long: 100001 tokens \u003e 100000 maximum","requestId":"req-cap"}`
++	calls := 0
++	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
++		calls++
++		return http.StatusBadRequest, raw, false
++	})
++	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999}), Upstream: up})
++	rec := httptest.NewRecorder()
++	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
++	if rec.Code != http.StatusBadRequest {
++		t.Fatalf("code=%d body=%s want 400 (never downgrade to 503)", rec.Code, rec.Body)
++	}
++	if calls != 1 {
++		t.Errorf("upstream calls=%d want 1 (no other account to rotate to)", calls)
++	}
++}
++
+ // TestChatImageInvalidPassesThroughWithoutRotation 上游图片错误是请求级确定性
+ // 错误：多账号池只调用一次，不冷却/禁用/累计失败，并逐字透传上游原文。
+ func TestChatImageInvalidPassesThroughWithoutRotation(t *testing.T) {
+@@ -163,3 +297,25 @@ func TestPromptTooLongMessageFallback(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// TestParsePromptMaxTokens 11115 原文里的 maximum 解析：'>' 未转义 / 单次 JSON 转义
++// （\u003e，本网关实际收到的形态）/ 双重转义都要取到，格式不符时 ok=false（调用方
++// 按真超限处理，不轮转）。转义串 \u003e 里自带数字 003，不能把散落数位拼起来。
++func TestParsePromptMaxTokens(t *testing.T) {
++	for _, tc := range []struct {
++		name string
++		in   string
++		want int64
++		ok   bool
++	}{
++		{"plain", `{"code":11115,"msg":"prompt is too long: 120000 tokens > 65536 maximum"}`, 65536, true},
++		{"escaped", `{"code":11115,"msg":"prompt is too long: 100001 tokens \u003e 100000 maximum"}`, 100000, true},
++		{"double-escaped", `{"msg":"prompt is too long: 100001 tokens \\u003e 100000 maximum"}`, 100000, true},
++		{"no limit", `{"code":11115,"msg":"prompt is too long"}`, 0, false},
++	} {
++		got, ok := parsePromptMaxTokens(tc.in)
++		if ok != tc.ok || got != tc.want {
++			t.Errorf("%s: parsePromptMaxTokens=%d,%v want %d,%v", tc.name, got, ok, tc.want, tc.ok)
++		}
++	}
++}

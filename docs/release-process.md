@@ -21,8 +21,9 @@
   3. `gh release upload upstream-src /tmp/upstream-pack/workbuddy2api-src.tar.gz --clobber`
      —— 覆盖到**固定的载体 Release**（tag `upstream-src`，**必须是 pre-release**：
      否则它会成为 `releases/latest`，把面板的更新检查带偏）；
-  4. 之后任何一次面板发版，CI 都会把它塞进发布包的 `upstream/`（取不到只告警、不
-     阻断发布），用户装/更新时就用它。
+  4. 之后任何一次面板发版，CI 都会把它塞进发布包的 `upstream/`。载体 Release
+     缺失、下载失败或包内缺少 `.upstream-id` 时，发布必须失败，不能发出无法更新
+     上游的半成品。
 - **改动上游代码**：改本地那份源码（`/opt/workbuddy2api`），
   然后 `docker compose up -d --build`。改的是别人的 MIT 代码，需保留其
   `LICENSE` 与版权声明。
@@ -197,25 +198,24 @@ git push origin main
 git tag vX.Y.Z && git push origin vX.Y.Z
 
 # 4) 等 CI 完成后，下载**最终产物**核对
-gh release download vX.Y.Z --repo ithtelab/workbuddy-manager \
+gh release download vX.Y.Z --repo AEmbers/workbuddy-manager \
   --pattern 'workbuddy-manager-vX.Y.Z.tar.gz' --dir /tmp/vX.Y.Z
 bash deploy/verify-release.sh /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz
 #    → 打印本地 sha256，与 Releases 页面「产物校验（sha256）」里的值比一眼
 tar tzf /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz | head -5      # 抽查包结构
 #    再解开看 .version 与 server/main.py 的版本号
 
-# 5) 给旧版更新器补过渡签名（v1.0.85 及更早仍强制验签；私钥只在维护者本机）
-cd /tmp/vX.Y.Z
-ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file workbuddy-manager-vX.Y.Z.tar.gz
-gh release upload vX.Y.Z workbuddy-manager-vX.Y.Z.tar.gz.sig \
-  --repo ithtelab/workbuddy-manager
-#    验一下再继续（用仓库里记录的公钥，或 update.py 里内嵌的那把）：
-#    printf 'release %s\n' "$(cat ~/.ssh/workbuddy-release.pub)" > allowed_signers
-#    ssh-keygen -Y verify -f allowed_signers -I release -n file \
-#      -s workbuddy-manager-vX.Y.Z.tar.gz.sig < workbuddy-manager-vX.Y.Z.tar.gz
+# 5) （只有拿得到原发布私钥时）给旧版更新器补过渡签名
+#    AEmbers fork 没有原维护者的 ~/.ssh/workbuddy-release 私钥；不要用新密钥
+#    生成同名 .sig 冒充兼容签名。拿不到时跳过这一步，并在 Release Notes 明示
+#    ≤v1.0.85 需要手动升级或临时设置 WB_SKIP_SIGNATURE=1。
+# cd /tmp/vX.Y.Z
+# ssh-keygen -Y sign -f ~/.ssh/workbuddy-release -n file workbuddy-manager-vX.Y.Z.tar.gz
+# gh release upload vX.Y.Z workbuddy-manager-vX.Y.Z.tar.gz.sig \
+#   --repo AEmbers/workbuddy-manager
 
 # 6) 核对无误后**发布**（草稿对用户不可见，这一步才让版本生效）
-gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
+gh release edit vX.Y.Z --repo AEmbers/workbuddy-manager --draft=false
 ```
 
 关键的一条：**草稿不发布，用户永远看不到这个版本** —— 面板与更新器的版本检查都读
@@ -224,9 +224,9 @@ gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 用户侧看到的一直是上一个**已发布且产物齐全**的版本。
 
 2026-10-14 起**新版本更新器不再要求签名**：只核对发布页给的 sha256 与文件大小
-（发布说明里就印着那个哈希，工作流自动附上）。但 `.sig` 仍要按第 5 步手工补 ——
-停在 v1.0.85 及更早的更新器强制验签，漏掉就会让这批老部署无法升级。为什么这样
-过渡、私钥如何保管，见 [release-signing.md](release-signing.md)。
+（发布说明里就印着那个哈希，工作流自动附上）。原维护期仍会手工补过渡 `.sig`；
+AEmbers fork 没有原私钥，所以 v2.8.4 不带该资产，停在 v1.0.85 及更早的部署
+需要按 [release-signing.md](release-signing.md) 手动升级一次。
 
 ## 发布包字节的可复现性
 
@@ -270,12 +270,12 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 **维护者收尾（核对 + 发布）**
 
 ```bash
-gh release download vX.Y.Z --repo ithtelab/workbuddy-manager \
+gh release download vX.Y.Z --repo AEmbers/workbuddy-manager \
   --pattern 'workbuddy-manager-vX.Y.Z.tar.gz' --dir /tmp/vX.Y.Z
 bash deploy/verify-release.sh /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz  # 与发布页哈希对一眼
 tar tzf /tmp/vX.Y.Z/workbuddy-manager-vX.Y.Z.tar.gz | head -5              # 抽查包结构
 # 解开看 .version / server/main.py 的版本号之后发布：
-gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
+gh release edit vX.Y.Z --repo AEmbers/workbuddy-manager --draft=false
 ```
 
 **协作者推完 tag、维护者还没核对之前，用户侧什么都看不到**：CI 建的是草稿，而版本
@@ -297,7 +297,7 @@ gh release edit vX.Y.Z --repo ithtelab/workbuddy-manager --draft=false
 
 ```bash
 # 查看
-gh api repos/ithtelab/workbuddy-manager/rulesets \
+gh api repos/AEmbers/workbuddy-manager/rulesets \
   --jq '.[] | "\(.id) \(.name) \(.target)"'
 ```
 
@@ -319,7 +319,7 @@ gh api repos/ithtelab/workbuddy-manager/rulesets \
 REST 接口只回显整数，GraphQL 会给出 `repositoryRoleName`：
 
 ```bash
-gh api graphql -f query='{ repository(owner:"ithtelab", name:"workbuddy-manager") {
+gh api graphql -f query='{ repository(owner:"AEmbers", name:"workbuddy-manager") {
   rulesets(first:10){ nodes { name target bypassActors(first:20){
     nodes { repositoryRoleDatabaseId repositoryRoleName bypassMode } } } } } }'
 ```

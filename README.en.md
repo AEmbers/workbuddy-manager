@@ -11,11 +11,16 @@ A web console for [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-22c55e)
 
-[![Release](https://img.shields.io/github/v/release/ithtelab/workbuddy-manager?color=22c55e&label=Release)](https://github.com/ithtelab/workbuddy-manager/releases)
+[![Release](https://img.shields.io/github/v/release/AEmbers/workbuddy-manager?color=22c55e&label=Release)](https://github.com/AEmbers/workbuddy-manager/releases)
 [![Changelog](https://img.shields.io/badge/Changelog-CHANGELOG-blue)](CHANGELOG.md)
-[![Issues](https://img.shields.io/github/issues/ithtelab/workbuddy-manager?color=f59e0b&label=Issues)](https://github.com/ithtelab/workbuddy-manager/issues)
+[![Issues](https://img.shields.io/github/issues/AEmbers/workbuddy-manager?color=f59e0b&label=Issues)](https://github.com/AEmbers/workbuddy-manager/issues)
 
 **English** · [简体中文](README.md) ｜ Documented and discussed in the [LINUX DO](https://linux.do) community
+
+> **Maintenance status**: The original `ithtelab/workbuddy-manager` stopped
+> after v2.8.3. This fork is now independently maintained by **AEmbers**;
+> subsequent releases, issues, update packages, and container images come from
+> [AEmbers/workbuddy-manager](https://github.com/AEmbers/workbuddy-manager).
 
 <p align="center">
   <strong>⚠️ Intended use:</strong> this project is only for managing accounts that <strong>you or your family members have voluntarily authorized</strong>. Bulk registration, account trading, registration-on-behalf, SMS-code farming, account theft, bypassing platform risk controls, resale, or any for-profit use are prohibited. By using this project you agree to the <a href="#intended-use--disclaimer">full disclaimer</a>.
@@ -70,7 +75,7 @@ it makes a capable upstream gateway visible and manageable. The two fit together
   code for it, so the upstream can stay lean
 
 Contributions are welcome: both panel and upstream-source issues and ideas belong in
-[this repository](https://github.com/ithtelab/workbuddy-manager/issues) — the original
+[this repository](https://github.com/AEmbers/workbuddy-manager/issues) — the original
 upstream repo is gone, and its source is now maintained here.
 
 ---
@@ -134,13 +139,13 @@ You need a server that can run Docker (1 vCPU / 1 GB is enough). Pick one:
 **① Docker (run the container yourself)**
 
 ```bash
-docker run -d --name workbuddy-manager -p 7864:7864 -v /opt/workbuddy-manager/data:/app/data ghcr.io/ithtelab/workbuddy-manager:latest
+docker run -d --name workbuddy-manager -p 7864:7864 -v /opt/workbuddy-manager/data:/app/data ghcr.io/aembers/workbuddy-manager:latest
 ```
 
 **② One-shot installer (dependencies, package, systemd)**
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/main/deploy/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/AEmbers/workbuddy-manager/main/deploy/install.sh)
 ```
 
 Then open `http://<your-server>:7864`; the initial admin password is printed in the first
@@ -232,15 +237,15 @@ Threat model and hardening notes: [security notes](docs/security-notes.md) and t
 ## Changelog & feedback
 
 - **Changelog**: [CHANGELOG.md](CHANGELOG.md) — additions, fixes and changes per version
-- **Releases**: [Releases](https://github.com/ithtelab/workbuddy-manager/releases) — each
+- **Releases**: [Releases](https://github.com/AEmbers/workbuddy-manager/releases) — each
   version ships a deployable `.tar.gz` / `.zip` (with the built frontend); unpack and run
   `sudo bash deploy/install.sh`
-- **Feedback**: [report a bug](https://github.com/ithtelab/workbuddy-manager/issues/new?template=bug_report.yml) ·
-  [request a feature](https://github.com/ithtelab/workbuddy-manager/issues/new?template=feature_request.yml)
+- **Feedback**: [report a bug](https://github.com/AEmbers/workbuddy-manager/issues/new?template=bug_report.yml) ·
+  [request a feature](https://github.com/AEmbers/workbuddy-manager/issues/new?template=feature_request.yml)
 
 > Please include the version and error logs, and **remove any keys or tokens first**.
 > For issues with the upstream workbuddy2api itself, use
-> [this repository](https://github.com/ithtelab/workbuddy-manager/issues) — the upstream
+> [this repository](https://github.com/AEmbers/workbuddy-manager/issues) — the upstream
 > source ships with our releases.
 
 ### Release process

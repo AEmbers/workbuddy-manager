@@ -705,7 +705,7 @@ VERSION_CACHE_TTL = 6 * 3600          # 6 小时
 # 用 5 分钟换来界面及时恢复。
 _ASSETS_PENDING_TTL = 5 * 60
 # 管理端仓库（owner/name），用于查询最新 Release
-MANAGER_REPO = os.environ.get('WB_MANAGER_REPO') or 'ithtelab/workbuddy-manager'
+MANAGER_REPO = os.environ.get('WB_MANAGER_REPO') or 'AEmbers/workbuddy-manager'
 
 
 def github_token() -> str:

@@ -1,7 +1,7 @@
 # Enterprise Account Support for WorkBuddy Manager
 
 Patches that add **Tencent CodeBuddy / WorkBuddy enterprise account** support to
-[ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) and
+[AEmbers/workbuddy-manager](https://github.com/AEmbers/workbuddy-manager) and
 its upstream gateway `workbuddy2api`.
 
 [中文文档](README.md)

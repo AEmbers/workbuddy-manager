@@ -41,12 +41,16 @@ def _batch_files() -> list[Path]:
     found: list[Path] = []
     for p in _ROOT.rglob('*.cmd'):
         parts = set(p.parts)
-        if 'node_modules' in parts or '.git' in parts:
+        if parts & {
+            '.git', '.next', '.runtime', '.tools', '.venv', 'dist', 'node_modules',
+        }:
             continue
         found.append(p)
     for p in _ROOT.rglob('*.bat'):
         parts = set(p.parts)
-        if 'node_modules' in parts or '.git' in parts:
+        if parts & {
+            '.git', '.next', '.runtime', '.tools', '.venv', 'dist', 'node_modules',
+        }:
             continue
         found.append(p)
     return sorted(found)
@@ -289,6 +293,22 @@ class WindowsScriptLayoutTest(unittest.TestCase):
             with self.subTest(script=cmd):
                 self.assertIn(f'%~dp0{ps1}', scripts[cmd],
                               f'{cmd} 没有按 %~dp0 调同目录的 {ps1}')
+
+
+class WindowsPythonIsolationTest(unittest.TestCase):
+    """The bundled interpreter must not be shadowed by user-site packages."""
+
+    def test_python_env_disables_user_site(self) -> None:
+        src = (_ROOT / 'windows' / 'python-env.ps1').read_text(encoding='utf-8-sig')
+        self.assertIn("$env:PYTHONNOUSERSITE = '1'", src)
+
+    def test_prepare_can_reach_dependency_repair_and_rechecks(self) -> None:
+        src = (_ROOT / 'windows' / 'prepare.ps1').read_text(encoding='utf-8-sig')
+        self.assertIn("$ErrorActionPreference = 'Continue'", src)
+        self.assertIn('$importLog = & $python -c "import fastapi, uvicorn" 2>&1 | Out-String', src)
+        self.assertIn('$verifyCode = $LASTEXITCODE', src)
+        self.assertIn('Python 依赖修复后仍无法导入', src)
+        self.assertNotIn('2>$null | Out-Null', src)
 
 
 if __name__ == '__main__':

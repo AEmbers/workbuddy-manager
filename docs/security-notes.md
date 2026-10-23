@@ -39,7 +39,7 @@
 1. **改掉初始密码**，不要沿用部署脚本中的默认值
 2. **务必经 HTTPS 访问**：7863 / 7864 建议只监听 `127.0.0.1`，由反向代理对外
 3. 如需前置 CDN，请把 `WB_TRUSTED_PROXY_HOPS` 设为 CDN + 反代的层数
-4. 发现问题请走[私密渠道](https://github.com/ithtelab/workbuddy-manager/security/advisories/new)，
+4. 发现问题请走[私密渠道](https://github.com/AEmbers/workbuddy-manager/security/advisories/new)，
    **不要**公开提交 Issue
 
 > ⚠️ 公网暴露**必须**启用 HTTPS，否则会话 Cookie 与密码可被中间人窃取。

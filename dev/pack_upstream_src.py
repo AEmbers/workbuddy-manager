@@ -188,7 +188,7 @@ LICENSE 与版权声明。
         print(f'已打出 {out_path}（{len(files)} 个文件，{size / 1024:.0f} KB，sha256:{digest}…）')
         print('上传到固定 tag 的 Release（让 CI 取得到）：')
         print(f'  gh release upload upstream-src {out_path} --clobber '
-              f'--repo ithtelab/workbuddy-manager')
+              f'--repo AEmbers/workbuddy-manager')
     return 0
 
 

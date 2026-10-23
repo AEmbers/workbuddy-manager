@@ -1350,5 +1350,72 @@ class EndpointTest(unittest.TestCase):
         self.assertIn('boom', r.content.decode())
 
 
+class StructuredOutputTranslationTest(unittest.TestCase):
+    def test_json_schema_is_sent_and_turned_into_a_prompt_contract(self) -> None:
+        schema = {
+            'type': 'object',
+            'properties': {'answer': {'type': 'string'}},
+            'required': ['answer'],
+            'additionalProperties': False,
+        }
+        out = R.to_chat_request({
+            'model': 'm',
+            'input': 'What is 2+2?',
+            'text': {
+                'format': {
+                    'type': 'json_schema',
+                    'name': 'answer',
+                    'strict': True,
+                    'schema': schema,
+                },
+            },
+        })
+
+        self.assertEqual(out['response_format'], {
+            'type': 'json_schema',
+            'json_schema': {
+                'name': 'answer',
+                'schema': schema,
+                'strict': True,
+            },
+        })
+        system = [m for m in out['messages'] if m['role'] == 'system']
+        self.assertEqual(len(system), 1)
+        self.assertIn('valid JSON', system[0]['content'])
+        self.assertIn('Do not add commentary', system[0]['content'])
+        self.assertIn('"answer"', system[0]['content'])
+
+    def test_json_object_contract_does_not_add_unsupported_shape(self) -> None:
+        out = R.to_chat_request({
+            'model': 'm',
+            'input': 'Return the result.',
+            'text': {'format': {'type': 'json_object'}},
+        })
+
+        self.assertEqual(out['response_format'], {'type': 'json_object'})
+        self.assertIn('only one valid JSON object', out['messages'][0]['content'])
+        self.assertNotIn('json_schema', out)
+
+    def test_plain_text_format_is_unchanged(self) -> None:
+        out = R.to_chat_request({
+            'model': 'm',
+            'input': 'hello',
+            'text': {'format': {'type': 'text'}},
+        })
+
+        self.assertNotIn('response_format', out)
+        self.assertEqual(out['messages'], [{'role': 'user', 'content': 'hello'}])
+
+    def test_invalid_schema_is_ignored_instead_of_failing(self) -> None:
+        out = R.to_chat_request({
+            'model': 'm',
+            'input': 'hello',
+            'text': {'format': {'type': 'json_schema', 'name': '', 'schema': {}}},
+        })
+
+        self.assertNotIn('response_format', out)
+        self.assertEqual(out['messages'], [{'role': 'user', 'content': 'hello'}])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -629,11 +629,32 @@ class DockerAssetsTest(unittest.TestCase):
         """
         import subprocess
         import shutil
-        if not shutil.which('bash'):
+        bash = shutil.which('bash')
+        if sys.platform == 'win32':
+            candidates = [
+                Path(os.environ.get('ProgramFiles', 'C:/Program Files'))
+                / 'Git' / 'bin' / 'bash.exe',
+                Path(os.environ.get('ProgramFiles', 'C:/Program Files'))
+                / 'Git' / 'usr' / 'bin' / 'bash.exe',
+            ]
+            bash = str(next((p for p in candidates if p.is_file()), ''))
+        if not bash:
             self.skipTest('本环境没有 bash')
+        probe = subprocess.run(
+            [bash, '-c', 'exit 0'],
+            capture_output=True,
+            timeout=15,
+        )
+        if probe.returncode != 0:
+            self.skipTest('本环境的 bash 无法启动')
+        env = dict(os.environ)
+        if sys.platform == 'win32':
+            env['WB_BASH'] = bash
+            env['PATH'] = str(Path(bash).parent) + os.pathsep + env.get('PATH', '')
         r = subprocess.run(
             [sys.executable, str(_ROOT / 'dev' / 'check_dockerfile_build.py')],
-            capture_output=True, text=True, timeout=180,
+            capture_output=True, text=True, encoding='utf-8', errors='replace',
+            timeout=180, env=env,
         )
         self.assertEqual(r.returncode, 0,
                          '前端阶段分支判定不正确：' + r.stdout + r.stderr)

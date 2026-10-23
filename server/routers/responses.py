@@ -33,6 +33,7 @@ Harness 的 `openai-responses` 协议、部分 OpenAI 官方 SDK 用法）只发
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
@@ -44,6 +45,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import config, keysvc, upstreamsvc
+from ..services import image_budget
 from . import gateway
 
 logger = logging.getLogger('workbuddy.responses')
@@ -308,6 +310,55 @@ def _upstream_error_text(data: object, resp: object = None,
     if isinstance(text, str) and text.strip():
         return text[:300]
     return '上游返回错误'
+
+
+_IMAGE_BUDGET_REJECTION = re.compile(
+    r'\b(\d+)\s+tokens?\s+(?:>|\\u003[eE])\s*(\d+)\s+maximum\b',
+    re.IGNORECASE,
+)
+
+
+def _is_image_budget_rejection(status_code: int, message: str) -> bool:
+    """Whether an upstream 400 is the image-input budget rejection."""
+
+    if status_code not in (400, 413):
+        return False
+    match = _IMAGE_BUDGET_REJECTION.search(message)
+    if match is None:
+        return False
+    actual, maximum = (int(part) for part in match.groups())
+    # Text context limits use the model window (commonly 1M). The separate
+    # image admission budget is the only small ceiling handled here.
+    return actual > maximum and maximum <= 100_000
+
+
+async def _retry_payload_from_original(
+    body: dict,
+    custom_tool_names: set[str],
+    bridge: _ToolBridge,
+    mapped: str | None,
+    stream: bool,
+    previous_estimate: int,
+) -> dict | None:
+    """Rebuild from the original Responses body and force image compression."""
+
+    payload = to_chat_request(body, custom_tool_names, bridge)
+    if not payload.get('messages'):
+        raise ValueError('retry payload has no messages')
+    retry_stats = await asyncio.to_thread(
+        image_budget.apply_image_budget,
+        payload,
+        force_aggressive=True,
+    )
+    if retry_stats.estimated_after >= previous_estimate:
+        return None
+    if mapped:
+        payload['model'] = mapped
+    if stream:
+        payload.setdefault('stream_options', {})
+        if isinstance(payload['stream_options'], dict):
+            payload['stream_options'].setdefault('include_usage', True)
+    return payload
 
 
 # ── 请求：Responses → Chat Completions ───────────────────────
@@ -796,6 +847,10 @@ def to_chat_request(body: dict, custom_tool_names: set[str] | None = None,
                     break
 
     out['messages'] = messages
+    response_format, structured_contract = _structured_output_contract(body.get('text'))
+    if response_format is not None:
+        out['response_format'] = response_format
+    _inject_structured_output_contract(messages, structured_contract)
 
     if body.get('max_output_tokens') is not None:
         out['max_tokens'] = body['max_output_tokens']
@@ -876,6 +931,64 @@ def _images_as_user_messages(images: list[dict]) -> list[dict]:
     if not images:
         return []
     return [{'role': 'user', 'content': images}]
+
+
+def _structured_output_contract(text_config: object) -> tuple[dict | None, str]:
+    """Translate Responses ``text.format`` into a best-effort Chat contract.
+
+    Upstream currently accepts but ignores ``response_format``.  Sending the
+    Chat field keeps the request compatible with future upstream support; the
+    prompt contract is what makes JSON-only output work today.
+    """
+
+    if not isinstance(text_config, dict):
+        return None, ''
+    fmt = text_config.get('format')
+    if not isinstance(fmt, dict):
+        return None, ''
+    kind = str(fmt.get('type') or '')
+    if kind == 'json_object':
+        return (
+            {'type': 'json_object'},
+            'Return only one valid JSON object. Do not add commentary or '
+            'Markdown code fences.',
+        )
+    if kind != 'json_schema':
+        return None, ''
+
+    name = fmt.get('name')
+    schema = fmt.get('schema')
+    if not isinstance(name, str) or not name.strip() or not isinstance(schema, dict):
+        return None, ''
+    strict = bool(fmt.get('strict'))
+    response_format = {
+        'type': 'json_schema',
+        'json_schema': {
+            'name': name,
+            'schema': schema,
+            'strict': strict,
+        },
+    }
+    contract = (
+        'Return only one valid JSON value matching this JSON Schema. '
+        'Do not add commentary or Markdown code fences.\n'
+        + json.dumps(schema, ensure_ascii=False, separators=(',', ':'))
+    )
+    return response_format, contract
+
+
+def _inject_structured_output_contract(messages: list[dict], contract: str) -> None:
+    """Add one system-level contract without disturbing tool-call pairing."""
+
+    if not contract:
+        return
+    prefix = 'Structured output is required for this response. ' + contract
+    # Keep existing instructions ahead of the new contract.  Insert after the
+    # leading system block, before the first non-system message.
+    insert_at = 0
+    while insert_at < len(messages) and messages[insert_at].get('role') == 'system':
+        insert_at += 1
+    messages.insert(insert_at, {'role': 'system', 'content': prefix})
 
 
 # ── 响应：Chat Completions → Responses ───────────────────────
@@ -1602,6 +1715,13 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     # 的说明）；转换前压回上限，to_chat_request 拿到的就是已收敛的值。
     gateway.clamp_max_tokens(body)
 
+    if (
+        body.get('input') in (None, '', [])
+        and body.get('instructions') in (None, '')
+    ):
+        return _failed('input 为空：Responses 请求必须带 input 或 instructions',
+                       400, 'invalid_request_error', 'empty_input')
+
     ua = request.headers.get('user-agent')
     stream = bool(body.get('stream'))
     try:
@@ -1615,6 +1735,17 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     if not payload.get('messages'):
         return _failed('input 为空：Responses 请求必须带 input 或 instructions',
                        400, 'invalid_request_error', 'empty_input')
+
+    budget_stats = await asyncio.to_thread(image_budget.apply_image_budget, payload)
+    if budget_stats.compressed or budget_stats.placeholders:
+        logger.info(
+            'image budget images=%d estimated=%d->%d compressed=%d placeholders=%d',
+            budget_stats.image_count,
+            budget_stats.estimated_before,
+            budget_stats.estimated_after,
+            budget_stats.compressed,
+            budget_stats.placeholders,
+        )
 
     if mapped:
         payload['model'] = mapped
@@ -1635,41 +1766,51 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
 
     if not stream:
         try:
-            async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
-                resp = await client.post(url, json=payload,
-                                         headers=gateway._upstream_headers(upstream))
-            latency = int((time.time() - started) * 1000)
-            usage: dict = {}
-            try:
-                data = resp.json()
-                usage = data.get('usage') or {}
-            except Exception:  # noqa: BLE001
-                data = None
-            # 整份 usage 交过去（而不是只取 credit）：扣费与提示词缓存三段
-            # 都在这一份里，分开取就会出现「某条协议缓存永远是空的」（issue #69）。
-            gateway._record(
-                key, ip, model, mapped or '', resp.status_code,
-                _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
-                latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
-                usage=usage,
-            )
-            if resp.status_code >= 400:
-                return _failed(_upstream_error_text(data, resp), resp.status_code,
-                               hint=gateway._error_hint(data))
-            if not isinstance(data, dict):
-                # 200 但响应体不是 JSON：不能当作「成功但空回答」返回——那正是
-                # 最难排查的一种表现（客户端不重试、不报错）。原样把上游的响应
-                # 内容作为错误暴露出来，让问题可见。
-                return _failed('上游返回了无法解析的响应：' + resp.text[:300],
-                               502, 'api_error', 'upstream_invalid_body')
-            return JSONResponse(
-                # bridge 必须一起传：它负责把展开后的 Chat 名还原成客户端原名
-                # （命名空间子工具 / 重名改名）。漏传时非流式路径会把
-                # `read_file_2` 这类内部名原样发给客户端，而**同一个请求只要带上
-                # stream 就会还原**——同一个请求换个标志就得到两套工具名，
-                # 客户端按名字回传下一轮时会匹配不上。
-                to_responses_object(data, model, resp_id, custom_tool_names, bridge)
-            )
+            for attempt in range(2):
+                async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
+                    resp = await client.post(url, json=payload,
+                                             headers=gateway._upstream_headers(upstream))
+                latency = int((time.time() - started) * 1000)
+                usage: dict = {}
+                try:
+                    data = resp.json()
+                    usage = data.get('usage') or {}
+                except Exception:  # noqa: BLE001
+                    data = None
+                # 整份 usage 交过去（而不是只取 credit）：扣费与提示词缓存三段
+                # 都在这一份里，分开取就会出现「某条协议缓存永远是空的」（issue #69）。
+                gateway._record(
+                    key, ip, model, mapped or '', resp.status_code,
+                    _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
+                    latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
+                    usage=usage,
+                )
+                if resp.status_code >= 400:
+                    message = _upstream_error_text(data, resp)
+                    if (
+                        attempt == 0
+                        and budget_stats.compressible_count > 0
+                        and _is_image_budget_rejection(resp.status_code, message)
+                    ):
+                        retry_payload = await _retry_payload_from_original(
+                            body, custom_tool_names, bridge, mapped, False,
+                            budget_stats.estimated_after,
+                        )
+                        if retry_payload is None:
+                            return _failed(message, resp.status_code,
+                                           hint=gateway._error_hint(data))
+                        payload = retry_payload
+                        continue
+                    return _failed(message, resp.status_code,
+                                   hint=gateway._error_hint(data))
+                if not isinstance(data, dict):
+                    # 200 但响应体不是 JSON：不能当作「成功但空回答」返回。
+                    return _failed('上游返回了无法解析的响应：' + resp.text[:300],
+                                   502, 'api_error', 'upstream_invalid_body')
+                return JSONResponse(
+                    to_responses_object(data, model, resp_id, custom_tool_names, bridge)
+                )
+            raise AssertionError('non-stream retry loop must return')
         except (CustomToolArgumentsError, ToolSearchArgumentsError) as exc:
             return _failed(
                 str(exc), 502, 'api_error',
@@ -1682,20 +1823,22 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
 
     # ── 流式 ──
     client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
-    try:
-        req = client.build_request('POST', url, json=payload,
-                                   headers=gateway._upstream_headers(upstream))
-        resp = await client.send(req, stream=True)
-    except Exception as exc:  # noqa: BLE001
-        await client.aclose()
-        latency = int((time.time() - started) * 1000)
-        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True)
-        return _failed(f'上游不可用：{exc}', 502)
+    resp = None
+    for attempt in range(2):
+        try:
+            req = client.build_request('POST', url, json=payload,
+                                       headers=gateway._upstream_headers(upstream))
+            resp = await client.send(req, stream=True)
+        except Exception as exc:  # noqa: BLE001
+            await client.aclose()
+            latency = int((time.time() - started) * 1000)
+            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True)
+            return _failed(f'上游不可用：{exc}', 502)
 
-    # 上游直接报错：**开流之前**用真实状态码回掉。
-    # 若开始流式（HTTP 200 已定），状态码就没法再改了——错误只能裹进事件里，
-    # 而客户端会把「流正常结束」当成成功，错误就显得像「空回答」。
-    if resp.status_code >= 400:
+        # Upstream errors before the SSE stream begins can still use their
+        # real HTTP status and can be retried after stronger compression.
+        if resp.status_code < 400:
+            break
         raw = b''
         try:
             # send(..., stream=True) returns an HTTPX Response, which does not
@@ -1715,8 +1858,26 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         latency = int((time.time() - started) * 1000)
         gateway._record(key, ip, model, mapped or '', resp.status_code, 0, 0, latency,
                         ua, text, True)
-        return _failed(_upstream_error_text(parsed, None, fallback=text),
-                       resp.status_code, hint=gateway._error_hint(parsed))
+        message = _upstream_error_text(parsed, None, fallback=text)
+        if (
+            attempt == 0
+            and budget_stats.compressible_count > 0
+            and _is_image_budget_rejection(resp.status_code, message)
+        ):
+            try:
+                retry_payload = await _retry_payload_from_original(
+                    body, custom_tool_names, bridge, mapped, True,
+                    budget_stats.estimated_after,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return _failed(f'请求转换失败：{exc}', 400)
+            if retry_payload is None:
+                return _failed(message, resp.status_code,
+                               hint=gateway._error_hint(parsed))
+            payload = retry_payload
+            client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
+            continue
+        return _failed(message, resp.status_code, hint=gateway._error_hint(parsed))
 
     async def gen():
         pending = ''

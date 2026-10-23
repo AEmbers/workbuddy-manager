@@ -189,7 +189,7 @@ python -m unittest discover -s server/tests -t .   # 安全用例与其他回归
 ```
 
 如发现新的安全问题，请通过
-[私密渠道](https://github.com/ithtelab/workbuddy-manager/security/advisories/new)
+[私密渠道](https://github.com/AEmbers/workbuddy-manager/security/advisories/new)
 报告，**不要**公开提交 Issue。
 
 ---

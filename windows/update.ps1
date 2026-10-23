@@ -154,7 +154,7 @@ function Get-LatestGitHubTag {
     if ($mirrorBase) {
         try {
             $apiParams = @{
-                Uri = "$mirrorBase" + 'https://api.github.com/repos/ithtelab/workbuddy-manager/releases/latest'
+                Uri = "$mirrorBase" + 'https://api.github.com/repos/AEmbers/workbuddy-manager/releases/latest'
                 Headers = @{"User-Agent"="workbuddy-updater"}
                 TimeoutSec = 15
             }
@@ -178,7 +178,7 @@ function Get-LatestGitHubTag {
             try {
                 $cArgs = @('-s', '-I', '--connect-timeout', '4')
                 if ($p) { $cArgs += @('-x', $p) }
-                $cArgs += 'https://github.com/ithtelab/workbuddy-manager/releases/latest'
+                $cArgs += 'https://github.com/AEmbers/workbuddy-manager/releases/latest'
                 $lines = & $curlExe $cArgs
                 foreach ($line in $lines) {
                     if ($line -match 'location:\s*.*?/releases/tag/([^\r\n/?#]+)') {
@@ -220,7 +220,7 @@ function Get-LatestGitHubTag {
     foreach ($p in $proxyList) {
         try {
             $apiParams = @{
-                Uri = "https://api.github.com/repos/ithtelab/workbuddy-manager/releases/latest"
+                Uri = "https://api.github.com/repos/AEmbers/workbuddy-manager/releases/latest"
                 Headers = @{"User-Agent"="PowerShell"}
                 TimeoutSec = 4
             }
@@ -309,7 +309,7 @@ if (-not $latestVer -and -not $existingPkg) {
     Write-Host "[TIP] 提示：您可登录 Web 管理面板，在「系统设置 → 一键更新」中直接更新。" -ForegroundColor Cyan
     $openBrowser = Read-Host "是否在浏览器中打开 GitHub Releases 页面手动下载？(Y/n)"
     if ($openBrowser -ne 'n' -and $openBrowser -ne 'N') {
-        Start-Process "https://github.com/ithtelab/workbuddy-manager/releases"
+        Start-Process "https://github.com/AEmbers/workbuddy-manager/releases"
         Write-Host "[WAIT] 正在监听下载目录（下载完 tar.gz 后会自动识别并更新）..." -ForegroundColor Cyan
         
         $startTime = [DateTime]::Now
@@ -361,7 +361,7 @@ $expectedDigest = if ($tagInfo -and $tagInfo.Digest) { "$($tagInfo.Digest)" } el
 if (-not $expectedDigest -and $latestVer) {
     try {
         # 配了镜像时先经镜像取摘要（api.github.com 可被镜像代理）
-        $apiUrl = "https://api.github.com/repos/ithtelab/workbuddy-manager/releases/tags/$latestVer"
+        $apiUrl = "https://api.github.com/repos/AEmbers/workbuddy-manager/releases/tags/$latestVer"
         $apiTargets = @()
         if ($mirrorBase) { $apiTargets += (New-MirrorUrl -Url $apiUrl -Mirror $mirrorBase) }
         $apiTargets += $apiUrl
@@ -392,7 +392,7 @@ if ($targetPkg) {
     Write-Host "[INFO] 已在目录中识别到本地安装包: $($targetPkg.FullName)" -ForegroundColor Green
     Copy-Item -Path $targetPkg.FullName -Destination $tempTar -Force
 } else {
-    $tarUrl = "https://github.com/ithtelab/workbuddy-manager/releases/download/$latestVer/workbuddy-manager-$latestVer.tar.gz"
+    $tarUrl = "https://github.com/AEmbers/workbuddy-manager/releases/download/$latestVer/workbuddy-manager-$latestVer.tar.gz"
     $curlExe = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
     $downloadSuccess = $false
 

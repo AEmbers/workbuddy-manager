@@ -147,14 +147,14 @@ patch_manager() {
     --restart unless-stopped \
     --network "$network" \
     "${run_args[@]}" \
-    "$(docker inspect "$MANAGER_CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || echo ghcr.io/ithtelab/workbuddy-manager:latest)" \
+    "$(docker inspect "$MANAGER_CONTAINER" --format '{{.Config.Image}}' 2>/dev/null || echo ghcr.io/aembers/workbuddy-manager:latest)" \
     >/dev/null 2>&1 || {
       warn "自动重建失败，请手工按下面参数重建："
       echo "  docker run -d --name $MANAGER_CONTAINER --restart unless-stopped --network host \\"
       echo "    -v /opt/workbuddy-manager/data:/app/data \\"
       echo "    -v $PATCH_DIR/tencent.py:/app/server/services/tencent.py:ro \\"
       echo "    -v $PATCH_DIR/wb2api.py:/app/server/services/wb2api.py:ro \\"
-      echo "    ghcr.io/ithtelab/workbuddy-manager:latest"
+      echo "    ghcr.io/aembers/workbuddy-manager:latest"
       die "重建失败"
     }
 

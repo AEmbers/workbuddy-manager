@@ -1,6 +1,6 @@
 # 企业账号额度支持补丁包
 
-让 `ithtelab/workbuddy-manager` + `workbuddy2api` 支持**腾讯 CodeBuddy/WorkBuddy 企业版账号**的额度显示与选号。
+让 `AEmbers/workbuddy-manager` + `workbuddy2api` 支持**腾讯 CodeBuddy/WorkBuddy 企业版账号**的额度显示与选号。
 
 > 上游（原版）不支持企业账号额度：企业额度不在个人「资源包」体系内，
 > 个人接口 `get-user-resource` 对企业账号恒返回空 `Accounts`，导致面板显示 0，
@@ -95,7 +95,7 @@ docker run -d --name workbuddy-manager \
   -v /opt/workbuddy2api-build/config.json:/opt/workbuddy2api/config.json:ro \
   -v /opt/workbuddy-manager/patches/tencent.py:/app/server/services/tencent.py:ro \
   -v /opt/workbuddy-manager/patches/wb2api.py:/app/server/services/wb2api.py:ro \
-  ghcr.io/ithtelab/workbuddy-manager:latest
+  ghcr.io/aembers/workbuddy-manager:latest
 ```
 
 ---

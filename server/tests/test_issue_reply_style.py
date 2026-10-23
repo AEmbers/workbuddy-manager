@@ -187,7 +187,7 @@ class ReplyCheckerBitesTest(unittest.TestCase):
 
     def test_urls_are_not_mistaken_for_paths(self) -> None:
         """URL 里的点号/斜杠不能被当成模块路径，否则每条带链接的回复都误报。"""
-        self.assertEqual(self.mod.check('详见 https://github.com/ithtelab/workbuddy-manager/issues/46'), [])
+        self.assertEqual(self.mod.check('详见 https://github.com/AEmbers/workbuddy-manager/issues/46'), [])
 
 
 class ReplyStandardIsDocumentedTest(unittest.TestCase):

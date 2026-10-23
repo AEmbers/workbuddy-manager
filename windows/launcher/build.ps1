@@ -42,7 +42,7 @@ $WebBuildRecipeVersion = '3'
 $UpstreamBuildRecipeVersion = '2'
 $RuntimeBuildRecipeVersion = '3'
 
-$UpstreamSrcUrl = 'https://github.com/ithtelab/workbuddy-manager/releases/download/upstream-src/workbuddy2api-src.tar.gz'
+$UpstreamSrcUrl = 'https://github.com/AEmbers/workbuddy-manager/releases/download/upstream-src/workbuddy2api-src.tar.gz'
 $UvUrl = 'https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip'
 $GoToolchainUrl = 'https://go.dev/dl/go1.27.0.windows-amd64.zip'
 # 显式用 Windows 自带 bsdtar：PATH 里的 GNU tar 会把 C:\ 路径当作「远程主机:路径」

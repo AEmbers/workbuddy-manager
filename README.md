@@ -11,11 +11,15 @@
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-22c55e)
 
-[![Release](https://img.shields.io/github/v/release/ithtelab/workbuddy-manager?color=22c55e&label=Release)](https://github.com/ithtelab/workbuddy-manager/releases)
+[![Release](https://img.shields.io/github/v/release/AEmbers/workbuddy-manager?color=22c55e&label=Release)](https://github.com/AEmbers/workbuddy-manager/releases)
 [![Changelog](https://img.shields.io/badge/更新日志-CHANGELOG-blue)](CHANGELOG.md)
-[![Issues](https://img.shields.io/github/issues/ithtelab/workbuddy-manager?color=f59e0b&label=反馈)](https://github.com/ithtelab/workbuddy-manager/issues)
+[![Issues](https://img.shields.io/github/issues/AEmbers/workbuddy-manager?color=f59e0b&label=反馈)](https://github.com/AEmbers/workbuddy-manager/issues)
 
 [English](README.en.md) · **简体中文** ｜ 本项目在 [LINUX DO](https://linux.do) 社区发布与交流
+
+> **维护状态**：原 `ithtelab/workbuddy-manager` 在 v2.8.3 后停止更新。
+> 本仓库现由 **AEmbers** 独立维护，后续版本、Issue、更新包与容器镜像均以
+> [AEmbers/workbuddy-manager](https://github.com/AEmbers/workbuddy-manager) 为准。
 
 <p align="center">
   <strong>⚠️ 使用边界：</strong>本项目只用于管理<strong>本人及亲属自愿授权</strong>的账号；禁止批量注册、账号交易、代注册、接码、盗号、绕过平台风控，以及任何商业转售或盈利性用途。使用即表示你已阅读并同意<a href="#使用边界与免责声明">完整免责声明</a>。
@@ -62,7 +66,7 @@
 - **上游专注自己的核心**：面板不要求上游为它改代码，让上游能保持精简
 
 欢迎参与共建：面板与上游源码的问题、想法都提到
-[本仓库](https://github.com/ithtelab/workbuddy-manager/issues)
+[本仓库](https://github.com/AEmbers/workbuddy-manager/issues)
 （上游源码随本项目的发布包分发）。
 
 ---
@@ -125,7 +129,7 @@
 
 **① Windows 安装器（桌面图形化，无需 Docker / 命令行）**
 
-1. 从该版本 [Release](https://github.com/ithtelab/workbuddy-manager/releases) 下载
+1. 从该版本 [Release](https://github.com/AEmbers/workbuddy-manager/releases) 下载
    `WorkBuddyManagerSetup.exe`（发版时由 CI 在 Windows runner 上自动构建并附带，同目录还有
    一个 `.sha256` 可核对）。v1.0.88 的安装器曾因卸载会误删文件被下线（见该版本 Release
    说明），**v1.0.89 起已修复**：卸载只删程序自己的文件，安装目录也改成「选中目录 +
@@ -145,13 +149,13 @@
 **② Docker（自己起容器）**
 
 ```bash
-docker run -d --name workbuddy-manager -p 7864:7864 -v /opt/workbuddy-manager/data:/app/data ghcr.io/ithtelab/workbuddy-manager:latest
+docker run -d --name workbuddy-manager -p 7864:7864 -v /opt/workbuddy-manager/data:/app/data ghcr.io/aembers/workbuddy-manager:latest
 ```
 
 **③ 服务器一键脚本（装依赖、拉包、配 systemd）**
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/main/deploy/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/AEmbers/workbuddy-manager/main/deploy/install.sh)
 ```
 
 装完浏览器打开 `http://<服务器>:7864`，首次启动的日志里会打印初始管理员密码。
@@ -236,13 +240,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ithtelab/workbuddy-manager/m
 ## 更新日志与反馈
 
 - **更新日志**：[CHANGELOG.md](CHANGELOG.md) —— 各版本的新增、修复与变更
-- **下载发布包**：[Releases](https://github.com/ithtelab/workbuddy-manager/releases) —— 每个版本提供可直接部署的
+- **下载发布包**：[Releases](https://github.com/AEmbers/workbuddy-manager/releases) —— 每个版本提供可直接部署的
   `.tar.gz` / `.zip`（含已构建的前端产物），解压后执行 `sudo bash deploy/install.sh` 即可
-- **反馈问题**：[提交 Bug](https://github.com/ithtelab/workbuddy-manager/issues/new?template=bug_report.yml) ·
-  [功能建议](https://github.com/ithtelab/workbuddy-manager/issues/new?template=feature_request.yml)
+- **反馈问题**：[提交 Bug](https://github.com/AEmbers/workbuddy-manager/issues/new?template=bug_report.yml) ·
+  [功能建议](https://github.com/AEmbers/workbuddy-manager/issues/new?template=feature_request.yml)
 
 > 反馈时请附上版本号与错误日志，并**先移除其中的密钥、Token 等敏感信息**。
-> 上游 workbuddy2api 自身的问题也提到[本仓库](https://github.com/ithtelab/workbuddy-manager/issues)
+> 上游 workbuddy2api 自身的问题也提到[本仓库](https://github.com/AEmbers/workbuddy-manager/issues)
 > ——上游源码随本项目的发布包分发。
 
 ### 版本发布流程

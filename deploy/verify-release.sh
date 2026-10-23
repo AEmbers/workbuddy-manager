@@ -33,7 +33,7 @@ ACTUAL="$(sha256sum "$ARCHIVE" | cut -d' ' -f1)"
 if [ -z "$EXPECTED" ]; then
   echo "本地 sha256：$ACTUAL"
   echo "把它与 Releases 页面「产物校验（sha256）」里的值比一眼："
-  echo "  https://github.com/ithtelab/workbuddy-manager/releases"
+  echo "  https://github.com/AEmbers/workbuddy-manager/releases"
   exit 0
 fi
 

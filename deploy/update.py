@@ -72,7 +72,7 @@ INSTALL_DIR = Path(os.environ.get('WB_INSTALL_DIR') or _default_install_dir())
 UPSTREAM_DIR = Path(os.environ.get('WB_UPSTREAM_DIR') or '/opt/workbuddy2api')
 UPSTREAM_PORT = int(os.environ.get('WB_UPSTREAM_PORT') or 7863)
 MANAGER_PORT = int(os.environ.get('WB_MANAGER_PORT') or 7864)
-MANAGER_REPO = os.environ.get('WB_MANAGER_REPO') or 'ithtelab/workbuddy-manager'
+MANAGER_REPO = os.environ.get('WB_MANAGER_REPO') or 'AEmbers/workbuddy-manager'
 
 
 def upstream_health_url() -> str:

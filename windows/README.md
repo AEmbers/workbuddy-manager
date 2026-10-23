@@ -91,7 +91,7 @@ powershell -ExecutionPolicy Bypass -File windows\launcher\build.ps1
   Python 的 `LICENSE.txt` 会随 `.runtime\python\` 一起打包，构建脚本在预置运行时
   缺少该文件时拒绝复用/打包。
 - **上游网关**：从固定的
-  [上游源码载体](https://github.com/ithtelab/workbuddy-manager/releases/download/upstream-src/workbuddy2api-src.tar.gz)
+  [上游源码载体](https://github.com/AEmbers/workbuddy-manager/releases/download/upstream-src/workbuddy2api-src.tar.gz)
   下载源码，再用 Go 编译 `./cmd/server` 生成 `wb2api.exe`；不是下载上游预编译二进制。
   上游源码中的 `upstream\LICENSE` 也会随包分发。
 - **无代码签名**：当前安装器没有 Authenticode 签名，Windows SmartScreen 可能显示

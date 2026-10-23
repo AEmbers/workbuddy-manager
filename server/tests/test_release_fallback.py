@@ -53,7 +53,7 @@ class RedirectFallback(_HTTPServerBase, unittest.TestCase):
                     self.send_header(
                         'Location',
                         f'http://127.0.0.1:{self.server.server_port}'
-                        '/ithtelab/workbuddy-manager/releases/tag/v9.9.9')
+                        '/AEmbers/workbuddy-manager/releases/tag/v9.9.9')
                     self.end_headers()
                 else:
                     self.send_response(404)
@@ -66,10 +66,10 @@ class RedirectFallback(_HTTPServerBase, unittest.TestCase):
         try:
             info = worker.fetch_release_via_redirect(
                 latest_url=f'http://127.0.0.1:{self.port}/releases/latest',
-                repo='ithtelab/workbuddy-manager')
+                repo='AEmbers/workbuddy-manager')
         finally:
             self.stop_server()
-        base = 'https://github.com/ithtelab/workbuddy-manager/releases/download/v9.9.9'
+        base = 'https://github.com/AEmbers/workbuddy-manager/releases/download/v9.9.9'
         self.assertTrue(result.get('visited'))
         self.assertEqual(info['tag'], 'v9.9.9')
         self.assertEqual(info['pkg_url'], f'{base}/workbuddy-manager-v9.9.9.tar.gz')
@@ -97,7 +97,7 @@ class RedirectFallback(_HTTPServerBase, unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 worker.fetch_release_via_redirect(
                     latest_url=f'http://127.0.0.1:{self.port}/releases/latest',
-                    repo='ithtelab/workbuddy-manager')
+                    repo='AEmbers/workbuddy-manager')
         finally:
             self.stop_server()
 

@@ -51,14 +51,21 @@ def _posix(p: Path) -> str:
 
 
 def run_case(label: str, setup, shell: str) -> tuple[int, str]:
+    bash = os.environ.get('WB_BASH') or shutil.which('bash') or 'bash'
     tmp = Path(tempfile.mkdtemp())
     try:
         setup(tmp)
         s = (shell.replace('/src', _posix(tmp / 'src'))
                   .replace('/dist', _posix(tmp / 'dist'))
                   .replace('/build', _posix(tmp / 'build')))
-        r = subprocess.run(['bash', '-c', s], capture_output=True, text=True,
-                           env={**os.environ, 'NPM_REGISTRY': ''})
+        r = subprocess.run(
+            [bash, '-c', s],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            env={**os.environ, 'NPM_REGISTRY': ''},
+        )
         return r.returncode, (r.stdout + r.stderr)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

@@ -9,6 +9,8 @@ httpx>=0.27.0
 # 用户看到的是「装了 socksio 才能用」，而不是「代理不通」。
 socksio>=1.0.0
 pydantic>=2.7.0
+# Image-budget preprocessing for inline screenshots and tool-returned images.
+Pillow>=11.0
 # PostgreSQL 异地备份的驱动（见 services/pgsync）。装成 [binary] 是为了拿到
 # 预编译的 libpq —— 纯 Python 版要求目标机上已有 libpq，而面板的部署环境
 # （容器 / systemd / Windows 原生）不保证有。用不到这个功能的部署不受影响：
