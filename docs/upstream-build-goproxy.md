@@ -2,7 +2,7 @@
 
 ## 现象
 
-国内网络（无法直连 proxy.golang.org）的面板「全部更新」停在「同步随包上游」的
+国内网络（无法直连 proxy.golang.org）的面板“全部更新”停在“同步随包上游”的
 重建步骤，更新日志尾部形如：
 
 ```text
@@ -13,7 +13,7 @@
 原因判断：网络问题（拉取基础镜像或 Go 依赖失败），稍后重试
 ```
 
-旧容器不受影响、服务继续可用，但面板与随包上游停在旧版本，重试永远卡在同一处。
+旧容器不受影响、服务继续可用，但面板、随包上游停在旧版本，重试永远卡在同一处。
 
 ## 根因
 
@@ -35,11 +35,11 @@ ENV GOPROXY=${GOPROXY}
 ```
 
 - 默认走 goproxy.cn（公共 CDN，海外同样可达，回源走 direct），不引入账号或
-  私有依赖；
+  私有依赖。
 - 需要别的代理时构建可覆盖：
-  `docker compose build --build-arg GOPROXY=https://proxy.golang.org,direct`；
+  `docker compose build --build-arg GOPROXY=https://proxy.golang.org,direct`。
 - 只影响构建阶段的模块下载，运行期行为不变。
 
 现场验证（腾讯云国内机型，2026-10-23）：同一台机器裸构建卡在 `go mod download`
-60 秒超时；打上本补丁后 `docker compose build --no-cache` 全程完成，产物二进制
+60 秒超时。打上本补丁后 `docker compose build --no-cache` 全程完成，产物二进制
 与代理前构建逐字节一致（md5 相同），确认代理只改变下载路径、不影响构建结果。
