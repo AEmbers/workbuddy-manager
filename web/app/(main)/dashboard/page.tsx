@@ -7,10 +7,13 @@ import {Users, CircleCheck, TriangleAlert, Activity, Server, Coins, ChevronRight
 import {
   Area,
   AreaChart,
+  Bar,
+  ComposedChart,
   CartesianGrid,
   Legend,
   Line,
   LineChart,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -19,7 +22,13 @@ import {
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {collectScopedExpiries} from '@/lib/dashboard-credits';
-import {getExpiryDailyGroup, groupExpiriesByDay} from '@/lib/display-prefs';
+import {
+  getCreditsFlowChartMode,
+  getExpiryDailyGroup,
+  groupExpiriesByDay,
+  setCreditsFlowChartMode,
+  type CreditsFlowChartMode,
+} from '@/lib/display-prefs';
 import {accountApi, statsApi, upstreamApi, upstreamsApi} from '@/lib/api';
 import {useRealm} from '@/lib/realm-context';
 import type {
@@ -370,6 +379,19 @@ export default function DashboardPage() {
   useEffect(() => {
     setDailyGroup(getExpiryDailyGroup());
   }, []);
+  /** 收支图表型：默认保持原双轴折线，柱状图把支出画在零线下方。 */
+  const [flowChartMode, setFlowChartMode] = useState<CreditsFlowChartMode>('line');
+  useEffect(() => {
+    setFlowChartMode(getCreditsFlowChartMode());
+  }, []);
+  const chooseFlowChartMode = (mode: CreditsFlowChartMode) => {
+    setFlowChartMode(mode);
+    setCreditsFlowChartMode(mode);
+  };
+  const flowChartData = useMemo(
+    () => flow.daily.map((point) => ({...point, expenseBar: -point.expense})),
+    [flow.daily],
+  );
 
   /**
    * 卡片上实际要显示的到期条目。
@@ -670,21 +692,49 @@ export default function DashboardPage() {
             <Coins className="h-4 w-4" />
             {t('dashboard.creditsFlowTitle')}
           </div>
-          <Select value={flowDays} onValueChange={setFlowDays}>
-            <SelectTrigger
-              className="h-8 w-[130px] rounded-full"
-              aria-label={t('dashboard.creditsFlowTitle')}
+          <div className="flex flex-wrap items-center gap-2">
+            <div
+              className="flex items-center rounded-full bg-background/70 p-0.5"
+              role="group"
+              aria-label={t('dashboard.creditsFlowView')}
             >
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="1">{t('stats.today')}</SelectItem>
-              <SelectItem value="3">{t('stats.last3')}</SelectItem>
-              <SelectItem value="7">{t('stats.last7')}</SelectItem>
-              <SelectItem value="15">{t('stats.last15')}</SelectItem>
-              <SelectItem value="30">{t('stats.last30')}</SelectItem>
-            </SelectContent>
-          </Select>
+              <Button
+                type="button"
+                size="sm"
+                variant={flowChartMode === 'line' ? 'secondary' : 'ghost'}
+                className="h-7 rounded-full px-2.5 text-[11px]"
+                aria-pressed={flowChartMode === 'line'}
+                onClick={() => chooseFlowChartMode('line')}
+              >
+                {t('dashboard.creditsFlowLine')}
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={flowChartMode === 'bar' ? 'secondary' : 'ghost'}
+                className="h-7 rounded-full px-2.5 text-[11px]"
+                aria-pressed={flowChartMode === 'bar'}
+                onClick={() => chooseFlowChartMode('bar')}
+              >
+                {t('dashboard.creditsFlowBar')}
+              </Button>
+            </div>
+            <Select value={flowDays} onValueChange={setFlowDays}>
+              <SelectTrigger
+                className="h-8 w-[130px] rounded-full"
+                aria-label={t('dashboard.creditsFlowTitle')}
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="1">{t('stats.today')}</SelectItem>
+                <SelectItem value="3">{t('stats.last3')}</SelectItem>
+                <SelectItem value="7">{t('stats.last7')}</SelectItem>
+                <SelectItem value="15">{t('stats.last15')}</SelectItem>
+                <SelectItem value="30">{t('stats.last30')}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         </div>
 
         {flowFailed && !flowState.values.flow ? (
@@ -720,34 +770,73 @@ export default function DashboardPage() {
             <div className="mt-4 h-[220px] w-full">
               {hasFlow ? (
                 <ResponsiveContainer width="100%" height="100%">
-                  {/* 左边距不能给负数：轴宽 48 减去它才是刻度的可用宽度，
-                      4 位数的刻度会越出图表左边缘被裁掉（issue #184 的遮挡就是这么来的）。 */}
-                  <LineChart data={flow.daily} margin={{top: 4, right: 4, bottom: 0, left: 0}}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
-                    <XAxis dataKey="day" tickLine={false} axisLine={false} fontSize={11}
-                           stroke="var(--muted-foreground)" />
-                    {/* 双 Y 轴：收入常是几千、支出常是几十。同一根轴会把支出压成
-                        贴着 0 的直线，等于没画。左轴收入、右轴支出，颜色与曲线对应。 */}
-                    <YAxis yAxisId="inc" tickLine={false} axisLine={false} fontSize={11}
-                           stroke="var(--chart-2)" width={52} />
-                    <YAxis yAxisId="exp" orientation="right" tickLine={false} axisLine={false}
-                           fontSize={11} stroke="var(--destructive)" width={48} />
-                    <Tooltip
-                      contentStyle={{
-                        background: 'var(--popover)',
-                        border: '1px solid var(--border)',
-                        borderRadius: 12,
-                        fontSize: 12,
-                      }}
-                    />
-                    <Legend wrapperStyle={{fontSize: 11}} />
-                    <Line yAxisId="inc" type="monotone" dataKey="income"
-                          name={t('dashboard.income')} stroke="var(--chart-2)"
-                          strokeWidth={2} dot={false} />
-                    <Line yAxisId="exp" type="monotone" dataKey="expense"
-                          name={t('dashboard.expense')} stroke="var(--destructive)"
-                          strokeWidth={2} dot={false} />
-                  </LineChart>
+                  {flowChartMode === 'bar' ? (
+                    <ComposedChart
+                      data={flowChartData}
+                      margin={{top: 4, right: 4, bottom: 0, left: 0}}
+                    >
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                      <XAxis dataKey="day" tickLine={false} axisLine={false} fontSize={11}
+                             stroke="var(--muted-foreground)" />
+                      <YAxis tickLine={false} axisLine={false} fontSize={11}
+                             stroke="var(--muted-foreground)" width={52} />
+                      <ReferenceLine y={0} stroke="var(--border)" />
+                      <Tooltip
+                        formatter={(value, name) => [
+                          fmtNumber(String(name) === t('dashboard.expense')
+                            ? Math.abs(Number(value))
+                            : Number(value)),
+                          String(name),
+                        ]}
+                        contentStyle={{
+                          background: 'var(--popover)',
+                          border: '1px solid var(--border)',
+                          borderRadius: 12,
+                          fontSize: 12,
+                        }}
+                      />
+                      <Legend wrapperStyle={{fontSize: 11}} />
+                      <Bar dataKey="income" name={t('dashboard.income')}
+                           fill="var(--chart-2)" radius={[4, 4, 0, 0]} />
+                      <Bar dataKey="expenseBar" name={t('dashboard.expense')}
+                           fill="var(--destructive)" radius={[0, 0, 4, 4]} />
+                      <Line type="monotone" dataKey="net"
+                            name={t('dashboard.creditsNet')}
+                            stroke="var(--chart-1)" strokeWidth={2}
+                            dot={flow.daily.length === 1 ? {r: 3} : false} />
+                    </ComposedChart>
+                  ) : (
+                    <LineChart data={flow.daily} margin={{top: 4, right: 4, bottom: 0, left: 0}}>
+                      {/* 左边距不能给负数：轴宽 48 减去它才是刻度的可用宽度，
+                          4 位数的刻度会越出图表左边缘被裁掉（issue #184 的遮挡就是这么来的）。 */}
+                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />
+                      <XAxis dataKey="day" tickLine={false} axisLine={false} fontSize={11}
+                             stroke="var(--muted-foreground)" />
+                      {/* 双 Y 轴：收入常是几千、支出常是几十。同一根轴会把支出压成
+                          贴着 0 的直线，等于没画。左轴收入、右轴支出，颜色与曲线对应。 */}
+                      <YAxis yAxisId="inc" tickLine={false} axisLine={false} fontSize={11}
+                             stroke="var(--chart-2)" width={52} />
+                      <YAxis yAxisId="exp" orientation="right" tickLine={false} axisLine={false}
+                             fontSize={11} stroke="var(--destructive)" width={48} />
+                      <Tooltip
+                        contentStyle={{
+                          background: 'var(--popover)',
+                          border: '1px solid var(--border)',
+                          borderRadius: 12,
+                          fontSize: 12,
+                        }}
+                      />
+                      <Legend wrapperStyle={{fontSize: 11}} />
+                      <Line yAxisId="inc" type="monotone" dataKey="income"
+                            name={t('dashboard.income')} stroke="var(--chart-2)"
+                            strokeWidth={2}
+                            dot={flow.daily.length === 1 ? {r: 3} : false} />
+                      <Line yAxisId="exp" type="monotone" dataKey="expense"
+                            name={t('dashboard.expense')} stroke="var(--destructive)"
+                            strokeWidth={2}
+                            dot={flow.daily.length === 1 ? {r: 3} : false} />
+                    </LineChart>
+                  )}
                 </ResponsiveContainer>
               ) : (
                 <div className="grid h-full place-items-center text-xs text-muted-foreground">

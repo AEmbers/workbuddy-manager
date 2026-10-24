@@ -27,6 +27,7 @@ import {
   Scale,
   FolderInput,
   TriangleAlert,
+  Grid3X3,
 } from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useAsyncAll} from '@/lib/use-async-data';
@@ -73,6 +74,7 @@ import {MoveAccountDialog} from '@/components/common/accounts/MoveAccountDialog'
 import {UpstreamFormDialog} from '@/components/common/upstreams/UpstreamFormDialog';
 import {AccountCoolingDialog} from '@/components/common/accounts/AccountCoolingDialog';
 import {AccountTaskDialog} from '@/components/common/accounts/AccountTaskDialog';
+import {AccountProbeMatrixDialog} from '@/components/common/accounts/AccountProbeMatrixDialog';
 import {useAuth} from '@/lib/auth-context';
 import {realmLabel, useRealm} from '@/lib/realm-context';
 import {useT} from '@/lib/i18n/provider';
@@ -128,6 +130,7 @@ export default function AccountsPage() {
   const [coolingTarget, setCoolingTarget] = useState<Account | null>(null);
   // 活动任务（单账号执行成长任务）的目标账号；null = 对话框关闭
   const [taskTarget, setTaskTarget] = useState<Account | null>(null);
+  const [probeOpen, setProbeOpen] = useState(false);
   const [busyFile, setBusyFile] = useState<string | null>(null);
   /**
    * 列表的检索 / 状态筛选 / 排序 / 页码（P1-3）。
@@ -1243,6 +1246,20 @@ export default function AccountsPage() {
               </Button>
             )}
             {isAdmin && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="rounded-full"
+                onClick={() => setProbeOpen(true)}
+                disabled={!merged.length}
+                title={t('accounts.probeMatrixDesc')}
+              >
+                <Grid3X3 />
+                <span className="hidden sm:inline">{t('accounts.probeMatrix')}</span>
+                <span className="sm:hidden">{t('accounts.probeMatrixShort')}</span>
+              </Button>
+            )}
+            {isAdmin && (
               <UploadAccountsButton upstreamId={groupId} groups={groups} onSuccess={reloadAll} />
             )}
             {isAdmin && (
@@ -1253,6 +1270,13 @@ export default function AccountsPage() {
             )}
           </>
         }
+      />
+
+      <AccountProbeMatrixDialog
+        accounts={merged}
+        open={probeOpen}
+        onOpenChange={setProbeOpen}
+        upstreamId={groupId}
       />
 
       {/* 二级导航（批次 4 ②：本页吸收了「任务记录」——账号是「主体」，

@@ -1,13 +1,26 @@
 'use client';
 
 import {useCallback, useRef, useState} from 'react';
-import {ScrollText, RotateCcw, Trash2, ChevronLeft, ChevronRight} from 'lucide-react';
+import {
+  ScrollText,
+  RotateCcw,
+  Trash2,
+  ChevronLeft,
+  ChevronRight,
+  RefreshCw,
+  Database,
+} from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {notify} from '@/lib/toast';
-import {keyApi, logApi} from '@/lib/api';
+import {http, keyApi, logApi} from '@/lib/api';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {useDebounced} from '@/lib/use-debounce';
-import type {ApiKey, RequestLog} from '@/lib/types';
+import type {
+  AccountCollectNowResult,
+  AccountCollectorStatus,
+  ApiKey,
+  RequestLog,
+} from '@/lib/types';
 import {fmtCredit, fmtDateTime, fmtDateTimeMarked, fmtLatency, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {EmptyState} from '@/components/common/layout/EmptyState';
@@ -102,6 +115,24 @@ function AccountCell({account}: {account: string | null}) {
   );
 }
 
+function channelLabel(channel: string | null | undefined, t: ReturnType<typeof useT>): string {
+  switch (channel) {
+    case 'cli': return t('logs.channelCli');
+    case 'vscode': return t('logs.channelVscode');
+    case 'workbuddy': return t('logs.channelWorkbuddy');
+    default: return t('logs.channelUnknown');
+  }
+}
+
+function validationLabel(code: string | null, t: ReturnType<typeof useT>): string {
+  if (!code) return t('logs.validationUnknown');
+  if (code === 'accepted') return t('logs.validationPassed');
+  if (code === 'rate_limited') return t('logs.validationRateLimited');
+  if (code === 'failed') return t('logs.validationFailed');
+  if (code.startsWith('mismatch:')) return t('logs.validationMismatch');
+  return t('logs.validationUnknown');
+}
+
 export default function LogsPage() {
   const t = useT();
   const {isAdmin} = useAuth();
@@ -109,6 +140,7 @@ export default function LogsPage() {
   const {realm} = useRealm();
   const [page, setPage] = useState(1);
   const [detail, setDetail] = useState<RequestLog | null>(null);
+  const [collecting, setCollecting] = useState(false);
 
   const [keyId, setKeyId] = useState('all');
   const [status, setStatus] = useState('all');
@@ -206,20 +238,41 @@ export default function LogsPage() {
     reload: reloadKeys,
   } = useAsyncAll({keys: () => keyApi.list()}, []);
 
+  const {
+    values: collectorValues,
+    errors: collectorErrors,
+    reload: reloadCollector,
+  } = useAsyncAll(
+    {
+      collector: () =>
+        http.get<AccountCollectorStatus>('/api/logs/account-collector').then((r) => r.data),
+    },
+    [],
+  );
+
   const logs: RequestLog[] = values.logs?.items ?? EMPTY_LOGS;
   const total = values.logs?.total ?? 0;
   const keys: ApiKey[] = keyValues.keys ?? EMPTY_KEYS;
+  const collector = collectorValues.collector;
 
-  const failedCount = Object.keys(logErrors).length + Object.keys(keyErrors).length;
+  const failedCount =
+    Object.keys(logErrors).length +
+    Object.keys(keyErrors).length +
+    Object.keys(collectorErrors).length;
 
   /** 重试：两组一起重来，避免「点了重试、密钥下拉还是空的」 */
   const retry = useCallback(() => {
     reloadLogs();
     reloadKeys();
-  }, [reloadLogs, reloadKeys]);
+    reloadCollector();
+  }, [reloadLogs, reloadKeys, reloadCollector]);
 
   // 新请求会不断写入日志；心跳刷新只更新当前筛选下的列表，不会重置筛选条件
-  useHeartbeat(reloadLogs, 60000);
+  const refreshLiveState = useCallback(() => {
+    reloadLogs();
+    reloadCollector();
+  }, [reloadLogs, reloadCollector]);
+  useHeartbeat(refreshLiveState, 60000);
 
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
@@ -255,6 +308,27 @@ export default function LogsPage() {
     applyModel('');
     applyIp('');
     setPage(1);
+  }
+
+  async function collectAccountsNow() {
+    if (collecting) return;
+    setCollecting(true);
+    try {
+      const response = await http.post<AccountCollectNowResult>(
+        '/api/logs/account-collector/collect',
+      );
+      reloadCollector();
+      reloadLogs();
+      if (response.data.ok) {
+        notify.ok(t('logs.collectorCollected', {n: response.data.result.filled}));
+      } else {
+        notify.err(response.data.status.last_error || t('logs.collectorCollectFailed'));
+      }
+    } catch {
+      notify.err(t('logs.collectorCollectFailed'));
+    } finally {
+      setCollecting(false);
+    }
   }
 
   const header = (
@@ -374,6 +448,90 @@ export default function LogsPage() {
         </div>
       </section>
 
+      {collector && (
+        <section className="rounded-[20px] border border-border/60 bg-muted/70 p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex min-w-0 items-start gap-3">
+              <div className="rounded-xl bg-background p-2 text-muted-foreground">
+                <Database className="h-4 w-4" />
+              </div>
+              <div className="min-w-0 space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-medium">{t('logs.collectorTitle')}</span>
+                  <Badge variant="secondary" className="rounded-full font-mono text-[10px]">
+                    {collector.source === 'native' ? 'native' : 'Docker'}
+                  </Badge>
+                  <Badge
+                    variant="secondary"
+                    className={
+                      'rounded-full text-[10px] ' +
+                      (collector.log_readable
+                        ? 'text-emerald-600 dark:text-emerald-400'
+                        : 'text-amber-600 dark:text-amber-400')
+                    }
+                  >
+                    {collector.log_readable
+                      ? t('logs.collectorReadable')
+                      : t('logs.collectorUnreadable')}
+                  </Badge>
+                </div>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                  <span>
+                    {t('logs.collectorLastAttempt')}:{' '}
+                    {collector.last_attempt_at
+                      ? fmtDateTime(collector.last_attempt_at)
+                      : t('logs.collectorNever')}
+                  </span>
+                  <span>
+                    {t('logs.collectorLastSuccess')}:{' '}
+                    {collector.last_success_at
+                      ? fmtDateTime(collector.last_success_at)
+                      : t('logs.collectorNever')}
+                  </span>
+                  <span>
+                    {t('logs.collectorMatched')}: {fmtNumber(collector.matched_count)}
+                  </span>
+                  <span>
+                    {t('logs.collectorUnmatched')}: {fmtNumber(collector.unmatched_count)}
+                  </span>
+                  <span>
+                    {t('logs.collectorAlreadyMatched')}: {fmtNumber(collector.already_matched_count)}
+                  </span>
+                  <span>
+                    {t('logs.collectorLastRound', {
+                      parsed: fmtNumber(collector.last_parsed_count),
+                      matched: fmtNumber(collector.last_matched_count),
+                    })}
+                  </span>
+                </div>
+                {collector.log_location && (
+                  <div className="break-all font-mono text-[10px] text-muted-foreground/80">
+                    {t('logs.collectorLocation')}: {collector.log_location}
+                  </div>
+                )}
+                {collector.last_error && (
+                  <div className="break-all text-[11px] text-amber-600 dark:text-amber-400">
+                    {t('logs.collectorError')}: {collector.last_error}
+                  </div>
+                )}
+              </div>
+            </div>
+            {isAdmin && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="rounded-full"
+                disabled={collecting}
+                onClick={collectAccountsNow}
+              >
+                <RefreshCw className={collecting ? 'animate-spin' : ''} />
+                {collecting ? t('logs.collectorCollecting') : t('logs.collectorCollect')}
+              </Button>
+            )}
+          </div>
+        </section>
+      )}
+
       <section className="overflow-hidden rounded-[20px] bg-muted">
         <Table>
           <TableHeader>
@@ -382,6 +540,7 @@ export default function LogsPage() {
               <TableHead className="text-[11px] text-muted-foreground">{t('nav.keys')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">IP</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('logs.colAccount')}</TableHead>
+              <TableHead className="text-[11px] text-muted-foreground">{t('logs.colReasoningChannel')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('nav.models')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('accounts.colStatus')}</TableHead>
               <TableHead className="text-[11px] text-muted-foreground">{t('logs.colFirstToken')}</TableHead>
@@ -405,6 +564,19 @@ export default function LogsPage() {
                     所以刚打完的请求可能还是「—」，稍后刷新就有。 */}
                 <TableCell className="text-xs">
                   <AccountCell account={l.account} />
+                </TableCell>
+                <TableCell className="space-y-1 text-xs">
+                  <Badge variant="secondary" className="rounded-full text-[10px]">
+                    {l.reasoning_effort || t('logs.reasoningUnspecified')}
+                  </Badge>
+                  <div className="text-[10px] text-muted-foreground">
+                    {channelLabel(l.client_channel, t)}
+                    {l.channel_validation && l.channel_validation !== 'accepted' && (
+                      <span className="ml-1" title={l.channel_validation}>
+                        · {validationLabel(l.channel_validation, t)}
+                      </span>
+                    )}
+                  </div>
                 </TableCell>
                 <TableCell className="text-xs">
                   {l.model || '—'}
@@ -539,9 +711,24 @@ export default function LogsPage() {
                 ['key', t('logs.rowKey'), detail.key_name || '—'],
                 // 账号来自上游日志回填，可能比请求本身晚几秒；这里只能说
                 // “尚未采集”，不能写成“非流式请求”——那是在猜原因。
-                ['account', t('logs.rowAccount'), detail.account || t('logs.accountPending')],
+                ['account', t('logs.rowAccount'), detail.account || t('logs.accountUnmatched')],
                 ['model', t('logs.rowModel'), detail.model || '—'],
                 ['mapped', t('logs.rowMappedModel'), detail.mapped_model || '—'],
+                [
+                  'reasoning',
+                  t('logs.rowReasoning'),
+                  detail.reasoning_effort || t('logs.reasoningUnspecified'),
+                ],
+                [
+                  'channel',
+                  t('logs.rowClientChannel'),
+                  channelLabel(detail.client_channel, t),
+                ],
+                [
+                  'validation',
+                  t('logs.rowChannelValidation'),
+                  validationLabel(detail.channel_validation, t),
+                ],
                 ['status', t('logs.rowStatus'), String(detail.status)],
                 [
                   'firstToken',
@@ -640,8 +827,8 @@ function FilterSkeleton() {
 
 /** 表格骨架：表头一行 + 8 行数据 + 底部页码条，列宽大致对着真实各列 */
 function LogsTableSkeleton() {
-  const headWidths = ['w-20', 'w-12', 'w-16', 'w-16', 'w-14', 'w-10', 'w-12', 'w-12', 'w-14', 'w-10'];
-  const cellWidths = ['w-24', 'w-14', 'w-20', 'w-20', 'w-16', 'w-10', 'w-12', 'w-12', 'w-16', 'w-12'];
+  const headWidths = ['w-20', 'w-12', 'w-16', 'w-16', 'w-20', 'w-14', 'w-10', 'w-12', 'w-12', 'w-14', 'w-10'];
+  const cellWidths = ['w-24', 'w-14', 'w-20', 'w-20', 'w-24', 'w-16', 'w-10', 'w-12', 'w-12', 'w-16', 'w-12'];
   return (
     <section className="overflow-hidden rounded-[20px] bg-muted">
       <div className="flex items-center gap-4 border-b border-border/60 px-4 py-2.5">

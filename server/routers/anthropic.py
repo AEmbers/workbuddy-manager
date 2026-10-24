@@ -176,7 +176,9 @@ def _resolve_key(request: Request):
 
 
 def _authorize(request: Request, model: str | None, *,
-               mapped: str | None = None) -> tuple[dict | None, str, JSONResponse | None]:
+               mapped: str | None = None,
+               reasoning_effort: str | None = None
+               ) -> tuple[dict | None, str, JSONResponse | None]:
     """完整鉴权：密钥 → 全局 IP 管控 → 密钥约束 → 限流。返回 `(key, ip, error)`。
 
     mapped：`model` 经「模型映射」后的名字，版本归属判它（issue #47，
@@ -192,6 +194,7 @@ def _authorize(request: Request, model: str | None, *,
     """
     ip = iputil.client_ip(request)
     ua = request.headers.get('user-agent')
+    channel = gateway._client_channel(request.headers, ua)
     path = request.url.path
 
     key, token = _resolve_key(request)
@@ -225,7 +228,11 @@ def _authorize(request: Request, model: str | None, *,
         ]
         if not iputil.evaluate(ip, rules, sec.get('mode', 'blacklist')):
             gateway._log_ip(ip, path, True, ua, 'ip_blocked')
-            gateway._record(key, ip, model or '', _mapped_for_log or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+            gateway._record(
+                key, ip, model or '', _mapped_for_log or '', 403, 0, 0, 0,
+                ua, 'IP 被拦截', False, reasoning_effort=reasoning_effort,
+                client_channel=channel,
+            )
             return None, ip, _err(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error')
 
     # 注意：`blocked=False` 的这一行现在默认**不写库**（审计日志只留拦截，
@@ -245,7 +252,11 @@ def _authorize(request: Request, model: str | None, *,
         # 与 gateway._authorize 同口径：状态码来自 keysvc，不再一律 403
         # （403 会被客户端显示成「API 密钥无效」，掩盖真实原因）。
         status = getattr(reason, 'status', 403)
-        gateway._record(key, ip, model or '', mapped or '', status, 0, 0, 0, ua, reason, False)
+        gateway._record(
+            key, ip, model or '', mapped or '', status, 0, 0, 0,
+            ua, reason, False, reasoning_effort=reasoning_effort,
+            client_channel=channel,
+        )
         # 也记进安全页的入站日志：走 /v1/messages 的客户端被拒时，此前在
         # 「IP 访问日志」里**完全看不到**（只有 gateway 那条路记），两套协议
         # 的审计口径不一致。原因码复用 gateway 的归类，避免两处写法漂移。
@@ -255,7 +266,11 @@ def _authorize(request: Request, model: str | None, *,
     limited, _count = gateway._rate_limited(key)
     if limited:
         msg = f'请求过于频繁（{gateway.RATE_WINDOW}s 内超过 {gateway.RATE_MAX_PER_MIN} 次）'
-        gateway._record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False)
+        gateway._record(
+            key, ip, model or '', mapped or '', 429, 0, 0, 0,
+            ua, msg, False, reasoning_effort=reasoning_effort,
+            client_channel=channel,
+        )
         gateway._log_ip(ip, path, True, ua, 'rate_limited')
         return None, ip, _err(msg, 429, 'rate_limit_error')
 
@@ -981,10 +996,19 @@ async def messages(request: Request):
     # 在必填性校验之后压回上限，转换层就能拿到已收敛的值。
     gateway.clamp_max_tokens(body)
 
+    # 日志中的档位必须与真正转发给上游的档位同源；to_openai_request 也会
+    # 调用同一映射，不按模型默认值猜，也不因协议不同丢失可观测性。
+    effort = _reasoning_effort(body)
+    channel = gateway._client_channel(
+        request.headers, request.headers.get('user-agent'),
+    )
+
     # 鉴权：与 gateway._authorize 同一套检查、同一顺序（见该函数说明）
     # 映射先算：版本归属判的是**映射后**的实际模型名（issue #47）
     mapped = gateway._map_model(model)
-    key, ip, auth_err = _authorize(request, model, mapped=mapped)
+    key, ip, auth_err = _authorize(
+        request, model, mapped=mapped, reasoning_effort=effort,
+    )
     if auth_err:
         return auth_err
 
@@ -998,7 +1022,10 @@ async def messages(request: Request):
     try:
         payload = to_openai_request(body)
     except Exception as exc:  # noqa: BLE001
-        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False)
+        gateway._record(
+            key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False,
+            reasoning_effort=effort, client_channel=channel,
+        )
         return _err(f'请求转换失败：{exc}')
 
     if mapped:
@@ -1012,7 +1039,10 @@ async def messages(request: Request):
     try:
         upstream = upstreamsvc.resolve_for_key(key)
     except upstreamsvc.UpstreamUnavailable as exc:
-        gateway._record(key, ip, model, mapped or '', 503, 0, 0, 0, ua, str(exc), False)
+        gateway._record(
+            key, ip, model, mapped or '', 503, 0, 0, 0, ua, str(exc), False,
+            reasoning_effort=effort, client_channel=channel,
+        )
         # anthropic 的错误体没有 code 字段（只有 type），故第三参给 type
         return _err(str(exc), 503, 'api_error')
     url = f'{upstream["base_url"]}/v1/chat/completions'
@@ -1036,7 +1066,7 @@ async def messages(request: Request):
                 key, ip, model, mapped or '', resp.status_code,
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
-                usage=usage,
+                usage=usage, reasoning_effort=effort, client_channel=channel,
             )
             if resp.status_code >= 400:
                 msg = ''
@@ -1051,7 +1081,11 @@ async def messages(request: Request):
                 data if isinstance(data, dict) else {}, model, thinking=want_thinking))
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            gateway._record(
+                key, ip, model, mapped or '', 502, 0, 0, latency,
+                ua, str(exc), False, reasoning_effort=effort,
+                client_channel=channel,
+            )
             return _err(f'上游不可用：{exc}', 502, 'api_error')
 
     # ── 流式 ────────────────────────────────────────────────
@@ -1063,7 +1097,11 @@ async def messages(request: Request):
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True)
+        gateway._record(
+            key, ip, model, mapped or '', 502, 0, 0, latency,
+            ua, str(exc), True, reasoning_effort=effort,
+            client_channel=channel,
+        )
         return _err(f'上游不可用：{exc}', 502, 'api_error')
 
     status_code = resp.status_code
@@ -1177,6 +1215,7 @@ async def messages(request: Request):
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
                 usage=usage, first_token=first_token_ms,
+                reasoning_effort=effort, client_channel=channel,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')

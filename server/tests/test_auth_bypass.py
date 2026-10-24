@@ -498,6 +498,27 @@ class KeysAuditRegressionTest(unittest.TestCase):
         self.assertTrue(str(body.get('key', '')).startswith('wbk_'),
                         '创建时必须回一次明文密钥')
 
+    def test_create_custom_key_and_reject_duplicate(self) -> None:
+        token = 'sk-route-custom-key-2.8.5'
+        body = {
+            'name': 'custom-route-key',
+            'key_mode': 'custom',
+            'custom_key': token,
+        }
+        r = self.c.post('/api/keys', json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['key'], token)
+
+        duplicate = self.c.post('/api/keys', json={**body, 'name': 'duplicate'})
+        self.assertEqual(duplicate.status_code, 409, duplicate.text)
+
+        invalid = self.c.post('/api/keys', json={
+            'name': 'too-short',
+            'key_mode': 'custom',
+            'custom_key': 'short',
+        })
+        self.assertEqual(invalid.status_code, 400, invalid.text)
+
     def test_delete_key_returns_200(self) -> None:
         created = self.c.post('/api/keys', json={'name': 'to-delete'}).json()
         r = self.c.delete(f"/api/keys/{created['id']}")

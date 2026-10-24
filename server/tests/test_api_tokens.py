@@ -196,6 +196,9 @@ class ApiTokenTest(unittest.TestCase):
             ('post', '/api/system/update', {'target': 'manager'}),
             ('post', '/api/security/logs/clear', None),
             ('post', '/api/users', {'username': 'x', 'password': '12345678', 'role': 'viewer'}),
+            # 矩阵探测会拿真实账号 token 按管理员配置的 base URL 出站。
+            ('post', '/api/accounts/probe-matrix',
+             {'files': ['workbuddy-x.json'], 'models': ['glm-5.2']}),
             # 评审补：这条同样是「重启上游容器」，与 /api/restart 同一个动作 ——
             # 不能因为走的是设置页那个路由就放宽给令牌（矩阵守卫也钉着它）。
             ('post', '/api/settings/upstash/reload', None),
@@ -275,6 +278,9 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         'PATCH /api/users/{username}',
         'POST /api/checkin-logs/clear',
         'POST /api/logs/clear',
+        # 账号日志立即采集会读取宿主机 Docker/native 日志，属于本机诊断动作；
+        # 管理 API Token 不应能借它触发宿主机采集。
+        'POST /api/logs/account-collector/collect',
         'POST /api/restart',
         'POST /api/security/config',
         'POST /api/security/logs/clear',
@@ -316,6 +322,12 @@ class WriteEndpointScopeMatrixTest(unittest.TestCase):
         # 面板前做」的动作，令牌（哪怕是管理员令牌）不行。导出虽然也是只对会话
         # 开放，但它是**读**接口，本清扫只看写接口，另见 ExportRequiresSessionTest。
         'POST /api/accounts/upload',
+        # 账号 × 模型矩阵探测（issue #270）：会用真实账号 accessToken 发起批量
+        # 出站请求，且 base URL 属于管理员可配置的凭据型目标。启动只接受会话；
+        # 轮询/取消不新带凭据，仍允许管理员令牌。
+        'POST /api/accounts/probe-matrix',
+        # 单账号测活执行同一类凭据型出站，也必须与矩阵启动保持同一权限边界。
+        'POST /api/accounts/{filename}/test',
         # PostgreSQL 异地备份：配置里带着能写整库的数据库凭据；导出会把全部数据
         # （含密钥哈希、请求日志）复制出去，恢复会**覆盖本地库**。三条都远超
         # 只读令牌该有的权限，与 /api/system/update 同级，只对会话开放。

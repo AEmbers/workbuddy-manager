@@ -1,13 +1,29 @@
 'use client';
 
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {KeyRound, Plus, Trash2, Ban, CircleCheck, Pencil, RotateCcw} from 'lucide-react';
+import {
+  KeyRound,
+  Plus,
+  Trash2,
+  Ban,
+  CircleCheck,
+  Pencil,
+  RotateCcw,
+  Eye,
+  EyeOff,
+} from 'lucide-react';
 import {useHeartbeat} from '@/lib/use-heartbeat';
 import {useAsyncAll} from '@/lib/use-async-data';
 import {notify} from '@/lib/toast';
 import {keyApi, upstreamsApi, errText} from '@/lib/api';
 import {BASE_PATH} from '@/lib/base-path';
-import type {ApiKey, KeyImportResult, KeyImportStatus, UpstreamEndpoint} from '@/lib/types';
+import type {
+  ApiKey,
+  ApiKeyCreate,
+  KeyImportResult,
+  KeyImportStatus,
+  UpstreamEndpoint,
+} from '@/lib/types';
 import {fmtDateTime, fmtNumber} from '@/lib/format';
 import {PageHeader} from '@/components/common/layout/PageHeader';
 import {PageSectionTabs} from '@/components/common/layout/PageSectionTabs';
@@ -55,6 +71,9 @@ import {
 
 interface FormState {
   name: string;
+  /** 仅新建生效：随机生成，或使用管理员输入的现成密钥。 */
+  keyMode: 'random' | 'custom';
+  customKey: string;
   /** 新建：0 = 永不过期；编辑：0 = 保持当前有效期不变 */
   expiresDays: string;
   /** 编辑时的有效期操作：keep 保持不变 / days 从现在起 N 天 / never 永不过期 */
@@ -73,6 +92,8 @@ interface FormState {
 
 const emptyForm: FormState = {
   name: '',
+  keyMode: 'random',
+  customKey: '',
   expiryMode: 'keep',
   expiresDays: '0',
   maxIps: '0',
@@ -139,6 +160,7 @@ export default function KeysPage() {
   const [editing, setEditing] = useState<ApiKey | null>(null);
   const [form, setForm] = useState<FormState>(emptyForm);
   const [busy, setBusy] = useState(false);
+  const [showCustomKey, setShowCustomKey] = useState(false);
   const [issued, setIssued] = useState<string | null>(null);
   /**
    * 一次性展示弹窗里选中的导出目标（cc-switch 还要分 Claude / Codex）。
@@ -220,6 +242,7 @@ export default function KeysPage() {
     setEditing(null);
     // 新建时默认跟随当前所在版本：在哪个版本的界面里建，就是哪个版本的密钥
     setForm({...emptyForm, realm});
+    setShowCustomKey(false);
     setUnknownModels(null);
     setFormOpen(true);
   }
@@ -228,6 +251,8 @@ export default function KeysPage() {
     setEditing(k);
     setForm({
       name: k.name,
+      keyMode: 'random',
+      customKey: '',
       // 默认不改动有效期；要续期/取消过期需显式选择
       expiryMode: 'keep',
       expiresDays: '0',
@@ -251,11 +276,22 @@ export default function KeysPage() {
       notify.err(t('keys.nameRequired'));
       return;
     }
+    if (!editing && form.keyMode === 'custom') {
+      const custom = form.customKey.trim();
+      if (custom.length < 16) {
+        notify.err(t('keys.customKeyTooShort'));
+        return;
+      }
+      if (!/^[\x21-\x7E]+$/.test(custom)) {
+        notify.err(t('keys.customKeyInvalid'));
+        return;
+      }
+    }
     submitting.current = true;
     setBusy(true);
     try {
       const days = Number(form.expiresDays) || 0;
-      const payload: Record<string, unknown> = {
+      const payload: ApiKeyCreate = {
         name: form.name.trim(),
         max_ips: Number(form.maxIps) || 0,
         ip_allowlist: toLines(form.ipAllowlist),
@@ -279,6 +315,10 @@ export default function KeysPage() {
       // 新建：填了天数才设过期（0 = 永不过期，不下发 expires_at）
       // 编辑：按显式选择处理，避免「打开就保存」把有效期重置
       if (!editing) {
+        payload.key_mode = form.keyMode;
+        if (form.keyMode === 'custom') {
+          payload.custom_key = form.customKey.trim();
+        }
         if (days > 0) payload.expires_at = Math.floor(Date.now() / 1000) + days * 86400;
       } else if (form.expiryMode === 'days') {
         if (days <= 0) {
@@ -790,6 +830,67 @@ export default function KeysPage() {
                 <Label className="text-[11px] text-muted-foreground">{t('keys.name')}</Label>
                 <Input value={form.name} onChange={(e) => setForm({...form, name: e.target.value})} placeholder={t('keys.namePlaceholder')} />
               </div>
+              {!editing && (
+                <div className="space-y-2">
+                  <Label className="text-[11px] text-muted-foreground">{t('keys.keySource')}</Label>
+                  <Tabs
+                    value={form.keyMode}
+                    onValueChange={(value) => {
+                      setForm({...form, keyMode: value as FormState['keyMode']});
+                      setShowCustomKey(false);
+                    }}
+                  >
+                    <TabsList className="grid w-full grid-cols-2 rounded-full">
+                      <TabsTrigger value="random" className="rounded-full">
+                        {t('keys.keyModeRandom')}
+                      </TabsTrigger>
+                      <TabsTrigger value="custom" className="rounded-full">
+                        {t('keys.keyModeCustom')}
+                      </TabsTrigger>
+                    </TabsList>
+                  </Tabs>
+                  {form.keyMode === 'custom' ? (
+                    <>
+                      <div className="relative">
+                        <Input
+                          type={showCustomKey ? 'text' : 'password'}
+                          value={form.customKey}
+                          maxLength={256}
+                          autoComplete="off"
+                          spellCheck={false}
+                          className="pr-10 font-mono text-xs"
+                          placeholder={t('keys.customKeyPlaceholder')}
+                          onChange={(e) => setForm({...form, customKey: e.target.value})}
+                        />
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className="absolute right-1 top-1 h-7 w-7 rounded-md"
+                          aria-label={showCustomKey
+                            ? t('keys.customKeyHide')
+                            : t('keys.customKeyShow')}
+                          title={showCustomKey
+                            ? t('keys.customKeyHide')
+                            : t('keys.customKeyShow')}
+                          onClick={() => setShowCustomKey((value) => !value)}
+                        >
+                          {showCustomKey
+                            ? <EyeOff className="h-3.5 w-3.5" />
+                            : <Eye className="h-3.5 w-3.5" />}
+                        </Button>
+                      </div>
+                      <p className="text-[11px] leading-4 text-muted-foreground">
+                        {t('keys.customKeyHint')}
+                      </p>
+                    </>
+                  ) : (
+                    <p className="text-[11px] leading-4 text-muted-foreground">
+                      {t('keys.randomKeyHint')}
+                    </p>
+                  )}
+                </div>
+              )}
               {!editing ? (
                 <div className="space-y-1.5">
                   <Label className="text-[11px] text-muted-foreground">{t('keys.expiresInDays')}</Label>

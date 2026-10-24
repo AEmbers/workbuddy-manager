@@ -30,11 +30,16 @@ mtime 作日期锚点、再按行内时钟还原秒数，见 `_native_timestamps
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import datetime
 import logging
+from pathlib import Path
 import re
+import shutil
+import threading
+import time
 
-from .. import db
+from .. import config, db
 from . import wb2api
 
 logger = logging.getLogger('workbuddy.accountlog')
@@ -71,6 +76,25 @@ _TS_PREFIX = re.compile(r'^(?P<stamp>\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+')
 
 # 原生写日志时上游只有时钟，没有日期：| #971 | 14:58:13 | ...
 _NATIVE_CLOCK = re.compile(r'\|\s*#\d+\s*\|\s*(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})\s*\|')
+
+
+_STATE_LOCK = threading.Lock()
+_STATE: dict[str, object] = {
+    'source': '',
+    'log_location': '',
+    'log_readable': False,
+    'last_attempt_at': None,
+    'last_success_at': None,
+    'last_parsed_count': 0,
+    'last_matched_count': 0,
+    'last_unmatched_count': 0,
+    'last_already_matched_count': 0,
+    'matched_count': 0,
+    'unmatched_count': 0,
+    'already_matched_count': 0,
+    'last_error': None,
+}
+
 
 def _parse_docker_ts(raw: str) -> int | None:
     """解析 docker --timestamps 的 RFC3339 UTC 前缀。"""
@@ -203,15 +227,156 @@ def parse_request_lines_with_mtime(lines: list[str], mtime: float | None) -> lis
     return out
 
 
+def _normalized_native_path() -> tuple[str, str | None]:
+    """规范化并校验 Windows/native 日志路径；错误文案不包含用户目录。"""
+    raw = str(config.WB2API_LOG_FILE).strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
+        raw = raw[1:-1].strip()
+    if not raw:
+        return '', '原生日志路径为空'
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        return str(path), '原生日志路径必须是绝对路径'
+    try:
+        if not path.exists():
+            return str(path), '原生日志文件不存在'
+        if not path.is_file():
+            return str(path), '原生日志路径不是普通文件'
+        with path.open('rb') as fh:
+            fh.read(1)
+    except PermissionError:
+        return str(path), '原生日志文件无读取权限'
+    except OSError as exc:
+        return str(path), f'原生日志文件不可读：{exc.strerror or exc.__class__.__name__}'
+    return str(path), None
+
+
+def _read_native_log(path: Path, limit: int) -> tuple[list[str], float]:
+    """直接读取已校验的 native 路径，避免引号/相对路径在底层被静默吞掉。"""
+    mtime = path.stat().st_mtime
+    with path.open('r', encoding='utf-8', errors='replace') as fh:
+        lines = [
+            line.rstrip('\r\n')
+            for line in deque(fh, maxlen=max(1, min(5000, limit)))
+            if line.strip()
+        ]
+    return lines, mtime
+
+
+def _collector_source() -> str:
+    return 'native' if config.WB2API_MODE == 'native' else 'docker'
+
+
+def _collector_location() -> str:
+    if _collector_source() == 'native':
+        return str(config.WB2API_LOG_FILE)
+    return str(config.WB2API_CONTAINER)
+
+
+def _state_update(**fields: object) -> None:
+    with _STATE_LOCK:
+        _STATE.update(fields)
+
+
+def collector_status() -> dict:
+    """返回内存中的采集诊断快照；不会读取日志或触发任何上游请求。"""
+    with _STATE_LOCK:
+        out = dict(_STATE)
+    out['source'] = _collector_source()
+    out['log_location'] = _collector_location()
+    out['poll_seconds'] = _POLL_SECONDS
+    out['running'] = bool(_collector and not _collector.done())
+    return out
+
+
+def _reset_status_for_tests() -> None:
+    global _collector
+    _collector = None
+    with _STATE_LOCK:
+        _STATE.update({
+            'source': '', 'log_location': '', 'log_readable': False,
+            'last_attempt_at': None, 'last_success_at': None,
+            'last_parsed_count': 0, 'last_matched_count': 0,
+            'last_unmatched_count': 0, 'last_already_matched_count': 0,
+            'matched_count': 0, 'unmatched_count': 0,
+            'already_matched_count': 0, 'last_error': None,
+        })
+
+
+def _collect_once_detailed() -> dict:
+    """采集一轮并维护诊断状态。异常会先记入状态，再交给调用方处理。"""
+    attempted = int(time.time())
+    source = _collector_source()
+    location = _collector_location()
+    _state_update(
+        source=source, log_location=location, last_attempt_at=attempted,
+        last_error=None,
+    )
+    readable = False
+    try:
+        if source == 'native':
+            native_path, path_error = _normalized_native_path()
+            if path_error:
+                raise RuntimeError(path_error)
+            lines, mtime = _read_native_log(Path(native_path), _TAIL)
+            readable = True
+        else:
+            if shutil.which('docker') is None:
+                raise RuntimeError('未找到 docker 命令')
+            lines, mtime = wb2api.read_container_logs(
+                _TAIL, timestamps=True, with_mtime=True,
+            )
+            readable = bool(lines)
+            if not lines:
+                raise RuntimeError('Docker 日志为空或不可读（请检查容器名与 Docker 权限）')
+
+        entries = parse_request_lines_with_mtime(lines, mtime)
+        counts = (
+            db.attach_request_accounts_detailed(entries)
+            if entries else
+            {'matched': 0, 'unmatched': 0, 'already_matched': 0,
+             'invalid': 0, 'errors': 0}
+        )
+        filled = int(counts.get('matched') or 0)
+        unmatched = int(counts.get('unmatched') or 0)
+        already_matched = int(counts.get('already_matched') or 0)
+        with _STATE_LOCK:
+            _STATE.update({
+                'log_readable': readable,
+                'last_success_at': attempted,
+                'last_parsed_count': len(entries),
+                'last_matched_count': filled,
+                'last_unmatched_count': unmatched,
+                'last_already_matched_count': already_matched,
+                # 上游 tail 会反复读到同一批行；累计会把每次重复扫描都算成失败，
+                # 因此这里展示**最近一轮**的匹配结果，另一个计数字段保留同值便于兼容。
+                'matched_count': filled,
+                'unmatched_count': unmatched,
+                'already_matched_count': already_matched,
+                'last_error': None,
+            })
+        return {
+            'parsed': len(entries),
+            'filled': filled,
+            'unmatched': unmatched,
+            'already_matched': already_matched,
+            'log_readable': readable,
+        }
+    except Exception as exc:  # noqa: BLE001
+        message = db._clean(str(exc), 300).strip() or '账号采集失败'
+        _state_update(log_readable=readable, last_error=message)
+        logger.warning('账号回填失败（不影响请求）: %s', message)
+        raise
+
+
 def _collect_once() -> int:
-    """读一次上游日志并回填账号。返回回填条数（同步，供 to_thread 调用）。"""
-    lines, mtime = wb2api.read_container_logs(_TAIL, timestamps=True, with_mtime=True)
-    if not lines:
-        return 0
-    entries = parse_request_lines_with_mtime(lines, mtime)
-    if not entries:
-        return 0
-    return db.attach_request_accounts(entries)
+    """兼容旧调用：返回本轮回填条数。"""
+    return int(_collect_once_detailed()['filled'])
+
+
+async def collect_once_async() -> dict:
+    """立即采集一次；供日志页的手动诊断入口调用。"""
+    return await asyncio.to_thread(_collect_once_detailed)
 
 
 async def _loop() -> None:
@@ -219,12 +384,13 @@ async def _loop() -> None:
         try:
             # 读 docker logs 是阻塞调用（subprocess），放线程池里跑——
             # 直接 await 会把事件循环卡住（网关的转发也在同一个循环上）。
-            filled = await asyncio.to_thread(_collect_once)
+            result = await asyncio.to_thread(_collect_once_detailed)
+            filled = int(result.get('filled') or 0)
             if filled:
                 logger.debug('回填账号 %d 条', filled)
-        except Exception as exc:  # noqa: BLE001
-            # 采集失败只是这一轮没有数据，下一轮继续；不影响任何请求
-            logger.warning('账号回填失败（不影响请求）: %s', exc)
+        except Exception:  # noqa: BLE001
+            # 失败状态已由 _collect_once_detailed 记录；下一轮继续，不影响转发。
+            pass
         await asyncio.sleep(_POLL_SECONDS)
 
 

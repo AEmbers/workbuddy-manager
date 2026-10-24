@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
-from .. import db, keysvc, security
+from .. import db, security
+from ..services import accountlog
 
 router = APIRouter(prefix='/api/logs', tags=['logs'])
 
@@ -103,6 +104,11 @@ def list_logs(
             # 账号是采集上游日志后按时间对回来的，比请求本身晚几秒，
             # 所以刚打完的请求这一列可能是空的（界面显示「—」，刷新即可）。
             'account': r['account'],
+            # 客户端实际传的推理档位；NULL = 未指定/历史记录，不能按模型默认值补。
+            'reasoning_effort': r['reasoning_effort'],
+            # 仅派生的渠道枚举与稳定校验短码，不含原始请求头（issue #233）。
+            'client_channel': r['client_channel'] or 'unknown',
+            'channel_validation': r['channel_validation'],
             # 输入侧命中缓存的 token 数。NULL 与 0 含义不同：
             # NULL = 上游没给这个字段，0 = 这次确实没命中（见 db 的列说明）。
             'cache_hit_tokens': r['cache_hit_tokens'],
@@ -110,6 +116,42 @@ def list_logs(
         for r in rows
     ]
     return {'total': total, 'items': items}
+
+
+def _collector_payload(user: dict, *, session_admin: bool = True) -> dict:
+    payload = accountlog.collector_status()
+    # 完整路径/容器名只给**会话**管理员；普通用户与 API Token 仍能看到来源、
+    # 可读性和脱敏错误状态，但不会拿到宿主机目录。
+    if user.get('role') != 'admin' or not session_admin:
+        payload['log_location'] = ''
+    return payload
+
+
+@router.get('/account-collector')
+def account_collector_status(
+    request: Request,
+    user: dict = Depends(security.current_user),
+) -> dict:
+    """账号回填诊断快照：不读日志、不触发上游调用。"""
+    return _collector_payload(
+        user, session_admin=getattr(request.state, 'token_id', None) is None,
+    )
+
+
+@router.post('/account-collector/collect')
+async def collect_accounts_now(
+    user: dict = Depends(security.require_session_admin),
+) -> dict:
+    """立即采集一次上游日志；采集失败作为诊断结果返回，不抬成 500。"""
+    try:
+        result = await accountlog.collect_once_async()
+        ok = True
+    except Exception:  # noqa: BLE001
+        # 具体脱敏后的错误已写进 collector_status().last_error。
+        result = {'parsed': 0, 'filled': 0, 'unmatched': 0,
+                  'already_matched': 0, 'log_readable': False}
+        ok = False
+    return {'ok': ok, 'result': result, 'status': _collector_payload(user)}
 
 
 @router.post('/clear')

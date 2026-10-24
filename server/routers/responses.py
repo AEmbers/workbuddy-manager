@@ -1704,10 +1704,14 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     if not isinstance(model, str) or not model.strip():
         return _failed('model 必须是字符串', 400, 'invalid_request_error', 'invalid_model')
 
+    effort = gateway._reasoning_effort(body)
+    channel = gateway._client_channel(request.headers, request.headers.get('user-agent'))
     # 鉴权：与 gateway._authorize 同一套检查、同一顺序（含版本隔离与配额）
     # 映射先算：版本归属判的是**映射后**的实际模型名（issue #47）
     mapped = gateway._map_model(model)
-    key, ip, auth_err = gateway._authorize(request, model, mapped=mapped)
+    key, ip, auth_err = gateway._authorize(
+        request, model, mapped=mapped, reasoning_effort=effort,
+    )
     if auth_err:
         return auth_err
 
@@ -1729,7 +1733,9 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         custom_tool_names = bridge.custom_names
         payload = to_chat_request(body, custom_tool_names, bridge)
     except Exception as exc:  # noqa: BLE001
-        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua, str(exc), False)
+        gateway._record(key, ip, model, mapped or '', 400, 0, 0, 0, ua,
+                        str(exc), False, reasoning_effort=effort,
+                        client_channel=channel)
         return _failed(f'请求转换失败：{exc}', 400)
 
     if not payload.get('messages'):
@@ -1759,7 +1765,9 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
     try:
         upstream = upstreamsvc.resolve_for_key(key)
     except upstreamsvc.UpstreamUnavailable as exc:
-        gateway._record(key, ip, model, mapped or '', 503, 0, 0, 0, ua, str(exc), False)
+        gateway._record(key, ip, model, mapped or '', 503, 0, 0, 0, ua,
+                        str(exc), False, reasoning_effort=effort,
+                        client_channel=channel)
         return _failed(str(exc), 503, 'api_error', 'upstream_unavailable')
     url = f'{upstream["base_url"]}/v1/chat/completions'
     started = time.time()
@@ -1783,7 +1791,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                     key, ip, model, mapped or '', resp.status_code,
                     _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                     latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
-                    usage=usage,
+                    usage=usage, reasoning_effort=effort,
+                    client_channel=channel,
                 )
                 if resp.status_code >= 400:
                     message = _upstream_error_text(data, resp)
@@ -1818,7 +1827,9 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 else 'invalid_custom_tool_arguments')
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua,
+                            str(exc), False, reasoning_effort=effort,
+                            client_channel=channel)
             return _failed(f'上游不可用：{exc}', 502)
 
     # ── 流式 ──
@@ -1832,7 +1843,9 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         except Exception as exc:  # noqa: BLE001
             await client.aclose()
             latency = int((time.time() - started) * 1000)
-            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua, str(exc), True)
+            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua,
+                            str(exc), True, reasoning_effort=effort,
+                            client_channel=channel)
             return _failed(f'上游不可用：{exc}', 502)
 
         # Upstream errors before the SSE stream begins can still use their
@@ -1857,7 +1870,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
             pass
         latency = int((time.time() - started) * 1000)
         gateway._record(key, ip, model, mapped or '', resp.status_code, 0, 0, latency,
-                        ua, text, True)
+                        ua, text, True, reasoning_effort=effort,
+                        client_channel=channel)
         message = _upstream_error_text(parsed, None, fallback=text)
         if (
             attempt == 0
@@ -1967,7 +1981,8 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 _as_int(usage.get('prompt_tokens')),
                 _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
-                usage=usage, first_token=first_token_ms,
+                usage=usage, first_token=first_token_ms, reasoning_effort=effort,
+                client_channel=channel,
             )
 
     return StreamingResponse(gen(), status_code=200, media_type='text/event-stream')

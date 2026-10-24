@@ -121,6 +121,9 @@ CREATE TABLE IF NOT EXISTS api_keys (
   last_used_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_keys_prefix ON api_keys(prefix);
+-- key_hash 是网关鉴权的最终身份。应用层「先查再插」无法阻止两个并发请求
+-- 同时通过检查，必须由 SQLite 做最后一道唯一性裁决。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_keys_hash ON api_keys(key_hash);
 
 CREATE TABLE IF NOT EXISTS api_key_ips (
   key_id     INTEGER NOT NULL,
@@ -153,7 +156,16 @@ CREATE TABLE IF NOT EXISTS request_logs (
   -- 版本（cn / global）：由请求的模型名前缀判定（上游的路由协议）。
   -- 为什么必须存：界面按版本切换时，日志与统计要跟着切；不存就无法回溯过滤。
   -- NULL = 该字段上线前的历史记录（或模型名无前缀）——按 cn 归类，见 realm_of_model。
-  realm             TEXT
+  realm             TEXT,
+  -- 客户端**实际请求**的推理档位（Chat reasoning_effort / Responses reasoning.effort）。
+  -- NULL = 没有传或属于本列上线前的历史记录；绝不按模型默认值补猜。
+  reasoning_effort  TEXT,
+  -- 仅保存由 UA/客户端标识派生出的渠道枚举：cli / vscode / workbuddy / unknown。
+  -- 原始请求头不落库，避免把认证头或自定义头写进日志。
+  client_channel    TEXT,
+  -- 渠道校验/限流结果的稳定摘要（accepted / rate_limited / mismatch:11140 / failed 等），
+  -- 不保存原始上游响应。此字段只用于取证，不驱动自动切渠道。
+  channel_validation TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_logs_ts ON request_logs(ts);
 
@@ -469,15 +481,23 @@ def connect() -> sqlite3.Connection:
             _conn.execute('PRAGMA synchronous=NORMAL')
             _conn.executescript(SCHEMA)
             _migrate(_conn)
+        except sqlite3.IntegrityError as exc:
+            # 旧库可能已有重复 key_hash（早期没有唯一约束）。此时不能删行、
+            # 也不能跳过索引继续启动：前者会擅自丢凭据，后者会让并发竞态
+            # 继续存在。保留数据并明确拒绝启动，交给管理员核对后处理。
+            message = str(exc)
+            _close_failed_connection()
+            if 'api_keys.key_hash' in message.lower():
+                raise RuntimeError(
+                    '数据库中存在重复的 API 密钥哈希（api_keys.key_hash），'
+                    '无法启用唯一约束。为防止误删凭据，启动已中止；'
+                    '请备份数据库，核对并合并或删除重复密钥后重试。'
+                ) from exc
+            raise RuntimeError(f'数据库初始化失败（完整性约束）：{message}') from exc
         except sqlite3.OperationalError as exc:
             # 失败时不要留下半开的连接：否则后续调用会拿到一个不能用的 _conn，
             # 报出更莫名的错误（例如「attempt to write a readonly database」）
-            if _conn is not None:
-                try:
-                    _conn.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                _conn = None
+            _close_failed_connection()
             raise RuntimeError(_explain_db_open_failure(exc)) from exc
         _conn.commit()
         # 建表之后再收紧权限：库文件此刻才确定存在，WAL 伴生文件也在初始化后出现
@@ -489,6 +509,18 @@ def connect() -> sqlite3.Connection:
         # 启动时也清一次侧表：低流量部署可能很久攒不够触发周期清理的写入量。
         _prune_side_tables()
     return _conn
+
+
+def _close_failed_connection() -> None:
+    """初始化失败时清掉半开连接，避免后续调用复用不可用状态。"""
+    global _conn
+    conn, _conn = _conn, None
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except sqlite3.Error:
+        pass
 
 
 def _close_connection_locked() -> None:
@@ -656,6 +688,11 @@ _MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     # 值形如 `昵称(uid8)`，与上游日志里的写法一致；脱敏与截断在写入侧做。
     # NULL = 未关联上（采集不可用、或该条在上游日志里已滚掉），界面显示「—」。
     ('request_logs', 'account', 'TEXT'),
+    # 客户端实际请求的推理档位（issue #267）。历史记录保持 NULL，不能按模型默认值猜。
+    ('request_logs', 'reasoning_effort', 'TEXT'),
+    # 客户端渠道与渠道校验摘要（issue #233）。只存派生枚举/稳定短码，不存原始头。
+    ('request_logs', 'client_channel', 'TEXT'),
+    ('request_logs', 'channel_validation', 'TEXT'),
     # 输入侧命中缓存的 token 数（上游 usage.prompt_cache_hit_tokens）。
     #
     # 为什么值得单独记：prompt_tokens 是**含**缓存的，光看它看不出这次省了
@@ -1171,15 +1208,17 @@ def add_request_log(**fields: object) -> None:
         'INSERT INTO request_logs(ts, key_id, ip, model, mapped_model, status, '
         'prompt_tokens, completion_tokens, latency_ms, first_token_ms, ua, error, '
         'stream, credit, realm, account, cache_hit_tokens, cache_miss_tokens, '
-        'cache_write_tokens) '
-        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'cache_write_tokens, reasoning_effort, client_channel, channel_validation) '
+        'VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         (fields.get('ts'), fields.get('key_id'), fields.get('ip'),
          fields.get('model'), fields.get('mapped_model'), fields.get('status'),
          fields.get('prompt_tokens'), fields.get('completion_tokens'),
          fields.get('latency_ms'), fields.get('first_token_ms'), fields.get('ua'),
          fields.get('error'), fields.get('stream'), fields.get('credit'),
          fields.get('realm'), fields.get('account'), fields.get('cache_hit_tokens'),
-         fields.get('cache_miss_tokens'), fields.get('cache_write_tokens')),
+         fields.get('cache_miss_tokens'), fields.get('cache_write_tokens'),
+         fields.get('reasoning_effort'), fields.get('client_channel'),
+         fields.get('channel_validation')),
     )
     _request_log_writes += 1
     if _request_log_writes >= _REQUEST_LOG_CHECK_EVERY:
@@ -1193,6 +1232,66 @@ def add_request_log(**fields: object) -> None:
 # 请求结束时取的 `int(time.time())`），所以能直接比。实测两者相差 < 1 秒
 # （RTT + 双方时钟），窗口给 3 秒覆盖慢链路与时钟漂移。
 _ACCOUNT_MATCH_WINDOW = 3
+
+
+def _attach_request_accounts(entries: Iterable[dict]) -> dict[str, int]:
+    """回填账号并返回逐项分类计数；兼容入口只取 matched。"""
+    stats = {'matched': 0, 'unmatched': 0, 'already_matched': 0,
+             'invalid': 0, 'errors': 0}
+    for e in entries:
+        ts = e.get('ts')
+        acct = _clean(e.get('account'), 64)
+        # bool 是 int 的子类：`ts=True` 会当成「1970-01-01 00:00:01」，虽然只会
+        # 匹配到空窗（几乎没有这种行），但没有时间戳就不该参与匹配。
+        if not isinstance(ts, int) or isinstance(ts, bool) or not acct:
+            stats['invalid'] += 1
+            continue
+        model = _clean(e.get('model'), 128)
+        # 模型名为空时**不能**匹配：`model = ''` 会命中「模型列也是空」的那些行
+        # （历史记录里存在），等于把账号填到一条毫不相干的日志上。宁可漏填。
+        if not model:
+            stats['invalid'] += 1
+            continue
+        try:
+            row = query_one(
+                'SELECT id FROM request_logs '
+                'WHERE account IS NULL AND ts BETWEEN ? AND ? '
+                '  AND (mapped_model = ? OR model = ?) '
+                'ORDER BY ABS(ts - ?) LIMIT 1',
+                (ts - _ACCOUNT_MATCH_WINDOW, ts + _ACCOUNT_MATCH_WINDOW,
+                 model, model, ts),
+            )
+            if row is not None:
+                execute('UPDATE request_logs SET account = ? WHERE id = ?',
+                        (acct, row['id']))
+                stats['matched'] += 1
+                continue
+
+            # 同一条上游 tail 行每轮都会被重新读到。若能找到窗口内同名模型、
+            # 但已经回填过的行，这是重复扫描而不是匹配失败；分开计数，避免
+            # 诊断面板在空闲时制造出大量假失败。
+            seen = query_one(
+                'SELECT id FROM request_logs '
+                'WHERE account IS NOT NULL AND ts BETWEEN ? AND ? '
+                '  AND (mapped_model = ? OR model = ?) '
+                'ORDER BY ABS(ts - ?) LIMIT 1',
+                (ts - _ACCOUNT_MATCH_WINDOW, ts + _ACCOUNT_MATCH_WINDOW,
+                 model, model, ts),
+            )
+            stats['already_matched' if seen is not None else 'unmatched'] += 1
+        except Exception:  # noqa: BLE001
+            # 回填是旁路：任何异常都不能影响采集循环的其余部分
+            stats['errors'] += 1
+            continue
+    return stats
+
+
+def attach_request_accounts_detailed(entries: Iterable[dict]) -> dict[str, int]:
+    """把上游日志条目分为 matched / unmatched / already_matched / invalid。
+
+    `already_matched` 是采集 tail 的重复扫描，不应显示成新的匹配失败。
+    """
+    return _attach_request_accounts(entries)
 
 
 def attach_request_accounts(entries: Iterable[dict]) -> int:
@@ -1211,37 +1310,7 @@ def attach_request_accounts(entries: Iterable[dict]) -> int:
     模型名两边都取**映射后**的名字（`mapped_model`），另兼看 `model` ——
     映射表变更时两边可能只对得上一个。
     """
-    filled = 0
-    for e in entries:
-        ts = e.get('ts')
-        acct = _clean(e.get('account'), 64)
-        # bool 是 int 的子类：`ts=True` 会当成「1970-01-01 00:00:01」，虽然只会
-        # 匹配到空窗（几乎没有这种行），但没有时间戳就不该参与匹配。
-        if not isinstance(ts, int) or isinstance(ts, bool) or not acct:
-            continue
-        model = _clean(e.get('model'), 128)
-        # 模型名为空时**不能**匹配：`model = ''` 会命中「模型列也是空」的那些行
-        # （历史记录里存在），等于把账号填到一条毫不相干的日志上。宁可漏填。
-        if not model:
-            continue
-        try:
-            row = query_one(
-                'SELECT id FROM request_logs '
-                'WHERE account IS NULL AND ts BETWEEN ? AND ? '
-                '  AND (mapped_model = ? OR model = ?) '
-                'ORDER BY ABS(ts - ?) LIMIT 1',
-                (ts - _ACCOUNT_MATCH_WINDOW, ts + _ACCOUNT_MATCH_WINDOW,
-                 model, model, ts),
-            )
-            if row is None:
-                continue
-            execute('UPDATE request_logs SET account = ? WHERE id = ?',
-                    (acct, row['id']))
-            filled += 1
-        except Exception:  # noqa: BLE001
-            # 回填是旁路：任何异常都不能影响采集循环的其余部分
-            continue
-    return filled
+    return _attach_request_accounts(entries)['matched']
 
 
 def add_ip_access_log(ip: object, path: object, blocked: bool, ua: object,

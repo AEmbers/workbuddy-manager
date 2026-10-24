@@ -11,6 +11,26 @@ import type {CreditExpiry} from './types';
 
 /** 仪表盘「最近到期积分」是否按天归并。 */
 const EXPIRY_DAILY_KEY = 'wb.expiry-daily-group';
+const CREDITS_FLOW_CHART_KEY = 'wb.credits-flow-chart';
+
+export type CreditsFlowChartMode = 'line' | 'bar';
+
+/** 积分收支图型；默认保持升级前的双轴折线。 */
+export function getCreditsFlowChartMode(): CreditsFlowChartMode {
+  try {
+    return window.localStorage.getItem(CREDITS_FLOW_CHART_KEY) === 'bar' ? 'bar' : 'line';
+  } catch {
+    return 'line';
+  }
+}
+
+export function setCreditsFlowChartMode(mode: CreditsFlowChartMode): void {
+  try {
+    window.localStorage.setItem(CREDITS_FLOW_CHART_KEY, mode);
+  } catch {
+    /* 隐私模式下只影响下次打开时的默认图型。 */
+  }
+}
 
 /**
  * 读取「到期积分按天模糊统计」开关。

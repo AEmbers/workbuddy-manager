@@ -19,6 +19,7 @@ namespace WorkBuddyLauncher
         private TextBox _txtDir;
         private CheckBox _chkDesktop;
         private CheckBox _chkStartMenu;
+        private CheckBox _chkAutoStart;
         private Label _lblSpace;
         private ProgressBar _progress;
         private Label _lblProgressTitle;
@@ -30,6 +31,8 @@ namespace WorkBuddyLauncher
         private bool _installFailed;
         private bool _isOverwrite;
         private string _installTarget;
+        private bool _autoStartEnabled;
+        private string _autoStartWarning;
 
         public InstallerForm()
             : base("安装 " + LauncherPaths.AppName, "WorkBuddy Manager 安装向导 · 内置全部运行环境")
@@ -111,7 +114,13 @@ namespace WorkBuddyLauncher
             _chkStartMenu.Checked = true;
             _pageLocation.Controls.Add(_chkStartMenu);
 
-            _lblSpace = MakePageText(_pageLocation, string.Empty, 198, 40);
+            _chkAutoStart = new CheckBox();
+            _chkAutoStart.Text = "登录 Windows 时自动启动（静默到托盘）";
+            _chkAutoStart.SetBounds(108, 188, 350, 22);
+            _chkAutoStart.Checked = false;
+            _pageLocation.Controls.Add(_chkAutoStart);
+
+            _lblSpace = MakePageText(_pageLocation, string.Empty, 214, 30);
             _lblSpace.ForeColor = SystemColors.GrayText;
         }
 
@@ -253,6 +262,11 @@ namespace WorkBuddyLauncher
 
             if (LauncherPaths.LooksInstalled(target))
             {
+                bool autoStartWasEnabled = false;
+                try { autoStartWasEnabled = StartupRegistration.IsEnabledFor(target); }
+                catch { }
+                // 覆盖安装保留原来的选择；新安装保持默认关闭。
+                _chkAutoStart.Checked = autoStartWasEnabled;
                 string oldVersion = Maintenance.ReadVersion(target);
                 string versionText = oldVersion.Length > 0 ? "（版本 " + oldVersion + "）" : string.Empty;
                 // 目标目录里配置的服务端口若正被监听，提示安装时将自动停止
@@ -286,6 +300,8 @@ namespace WorkBuddyLauncher
 
         private void StartInstall()
         {
+            _autoStartEnabled = _chkAutoStart.Checked;
+            _autoStartWarning = null;
             _installFailed = false;
             _progress.Value = 0;
             _lblProgressTitle.Text = "正在安装 " + LauncherPaths.AppName;
@@ -313,6 +329,10 @@ namespace WorkBuddyLauncher
                         return;
                     }
                     _lblDoneDetail.Text = "程序已安装到：\n" + target;
+                    if (_autoStartWarning != null)
+                    {
+                        _lblDoneDetail.Text += "\n\n开机自启未生效：" + _autoStartWarning;
+                    }
                     _pageIndex = 3;
                     ShowPage(_pageDone);
                     UpdateNav();
@@ -328,13 +348,13 @@ namespace WorkBuddyLauncher
                 // 覆盖安装：先按「保留数据」卸载旧程序文件（停运行中的服务、清快捷方式/注册表），
                 // 数据白名单（.env、data、upstream 认证与配置）原样保留
                 Report("正在关闭运行中的控制窗口…");
-                Maintenance.CloseRunningLauncher();
+                Maintenance.CloseRunningLauncher(target);
 
                 Report("正在停止运行中的服务…");
                 Maintenance.StopServices(target);
 
                 Report("正在清理旧程序文件…");
-                Maintenance.RemoveShortcutsAndRegistry();
+                Maintenance.RemoveShortcutsAndRegistry(target);
                 Maintenance.DeleteProgramFiles(target, true, null,
                     delegate(int done, int total, string name)
                     {
@@ -381,6 +401,19 @@ namespace WorkBuddyLauncher
                         Path.Combine(target, LauncherPaths.UninstallExeName), target, "卸载 " + LauncherPaths.AppName);
                 }
                 Diag("快捷方式创建完成");
+            }
+
+            Report("正在配置登录启动项…");
+            try
+            {
+                StartupRegistration.SetEnabled(target, _autoStartEnabled);
+                Diag("登录启动项已" + (_autoStartEnabled ? "启用" : "关闭"));
+            }
+            catch (Exception ex)
+            {
+                // 自启是可选能力，失败不应让已经复制完成的程序被记为“安装失败”。
+                _autoStartWarning = ex.Message;
+                Diag("登录启动项配置失败：" + ex.Message);
             }
 
             Report("正在注册卸载信息…");

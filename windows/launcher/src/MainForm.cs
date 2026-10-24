@@ -5,11 +5,94 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using System.Threading.Tasks;
 
 namespace WorkBuddyLauncher
 {
+    /// 托盘初始化返回 true 表示已确认 Explorer 托盘可用；false/异常一律 fail closed。
+    internal static class ShellTrayIntegration
+    {
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr FindWindow(string className, string windowName);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, string windowName);
+
+        public static bool IsReady()
+        {
+            IntPtr taskbar = FindWindow("Shell_TrayWnd", null);
+            return taskbar != IntPtr.Zero &&
+                FindWindowEx(taskbar, IntPtr.Zero, "TrayNotifyWnd", null) != IntPtr.Zero;
+        }
+
+        public static bool TryRegister(NotifyIcon tray)
+        {
+            if (tray == null || !IsReady()) { return false; }
+            try
+            {
+                tray.Visible = true;
+                return tray.Visible && IsReady();
+            }
+            catch
+            {
+                try { tray.Visible = false; }
+                catch { }
+                return false;
+            }
+        }
+    }
+
+    /// 静默登录启动的服务门。生产实现仍走 prepare.ps1 -> service-tools.ps1 start；
+    /// 测试可注入假门，避免碰机器上的真实端口和网关进程。
+    internal interface IAutostartServiceGate
+    {
+        bool IsHealthy(string connectHost, int port);
+        bool IsPortInUse(string connectHost, int port);
+        void Start(string installDir, Action<string> onLine, Action<int> onExit);
+    }
+
+    internal sealed class ExistingAutostartServiceGate : IAutostartServiceGate
+    {
+        private readonly ScriptRunner _runner;
+
+        public ExistingAutostartServiceGate(ScriptRunner runner)
+        {
+            _runner = runner;
+        }
+
+        public bool IsHealthy(string connectHost, int port)
+        {
+            return HealthProbe.Check(connectHost, port, 1000);
+        }
+
+        public bool IsPortInUse(string connectHost, int port)
+        {
+            return PortCheck.InUse(connectHost, port);
+        }
+
+        public void Start(string installDir, Action<string> onLine, Action<int> onExit)
+        {
+            if (_runner.IsRunning)
+            {
+                if (onExit != null) { onExit(-1); }
+                return;
+            }
+            _runner.Run(LauncherPaths.ScriptPath(installDir, "prepare.ps1"), null, onLine,
+                delegate(int prepareCode)
+                {
+                    if (prepareCode != 0)
+                    {
+                        if (onExit != null) { onExit(prepareCode); }
+                        return;
+                    }
+                    _runner.Run(LauncherPaths.ScriptPath(installDir, "service-tools.ps1"),
+                        new[] { "start" }, onLine, onExit);
+                });
+        }
+    }
+
     /// 控制模式主窗口：启停/重启项目、状态显示、监听配置、面板入口、托盘与关闭行为。
     internal sealed class MainForm : Form
     {
@@ -21,6 +104,8 @@ namespace WorkBuddyLauncher
         private readonly string _root;
         private readonly AppSettings _settings;
         private readonly ScriptRunner _runner = new ScriptRunner();
+        private readonly Func<NotifyIcon, bool> _trayInitializer;
+        private readonly IAutostartServiceGate _autostartGate;
         private readonly System.Windows.Forms.Timer _timer = new System.Windows.Forms.Timer();
         private readonly NotifyIcon _tray = new NotifyIcon();
 
@@ -34,6 +119,7 @@ namespace WorkBuddyLauncher
         private TextBox _txtHost;
         private TextBox _txtPort;
         private Button _btnSave;
+        private CheckBox _chkAutoStart;
         private TextBox _log;
 
         private ProjectState _state = ProjectState.Stopped;
@@ -43,13 +129,29 @@ namespace WorkBuddyLauncher
         private bool _reallyExit;
         private bool _openBrowserOnHealthy;
         private bool _credentialLookupRunning;
+        private bool _credentialPromptPending;
+        private bool _startedHidden;
+        private bool _trayReady;
+        private bool _suppressAutoStartEvent;
+        private bool _autostartProbePending;
+        private bool _autostartServicePending;
         private string _currentHost = EnvConfig.DefaultHost;
         private int _currentPort = EnvConfig.DefaultPort;
 
-        public MainForm(string root)
+        public MainForm(string root, bool startHidden)
+            : this(root, startHidden, ShellTrayIntegration.TryRegister, null)
+        {
+        }
+
+        internal MainForm(string root, bool startHidden,
+            Func<NotifyIcon, bool> trayInitializer,
+            IAutostartServiceGate autostartGate)
         {
             _root = root;
+            _startedHidden = startHidden;
             _settings = new AppSettings(LauncherPaths.SettingsFile);
+            _trayInitializer = trayInitializer ?? ShellTrayIntegration.TryRegister;
+            _autostartGate = autostartGate ?? new ExistingAutostartServiceGate(_runner);
 
             Text = LauncherPaths.AppName;
             Icon = AppIcon.Value;
@@ -57,7 +159,7 @@ namespace WorkBuddyLauncher
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
-            ClientSize = new Size(480, 512);
+            ClientSize = new Size(480, 542);
 
             BuildUi();
             // 横幅后添加（Dock 计算顺序：横幅先停靠顶部，内容面板填充剩余）
@@ -109,7 +211,7 @@ namespace WorkBuddyLauncher
 
             var configBox = new GroupBox();
             configBox.Text = "监听配置（保存后重启项目生效）";
-            configBox.SetBounds(24, 126, 432, 72);
+            configBox.SetBounds(24, 126, 432, 102);
             _content.Controls.Add(configBox);
 
             var hostLabel = new Label();
@@ -136,9 +238,15 @@ namespace WorkBuddyLauncher
             _btnSave.Click += OnSaveClick;
             configBox.Controls.Add(_btnSave);
 
+            _chkAutoStart = new CheckBox();
+            _chkAutoStart.Text = "登录 Windows 时自动启动（静默到托盘）";
+            _chkAutoStart.SetBounds(14, 66, 390, 22);
+            _chkAutoStart.CheckedChanged += OnAutoStartChanged;
+            configBox.Controls.Add(_chkAutoStart);
+
             var logLabel = new Label();
             logLabel.Text = "输出日志";
-            logLabel.SetBounds(24, 208, 432, 20);
+            logLabel.SetBounds(24, 238, 432, 20);
             _content.Controls.Add(logLabel);
 
             _log = new TextBox();
@@ -146,7 +254,7 @@ namespace WorkBuddyLauncher
             _log.ReadOnly = true;
             _log.ScrollBars = ScrollBars.Vertical;
             _log.BackColor = SystemColors.Window;
-            _log.SetBounds(24, 230, 432, 206);
+            _log.SetBounds(24, 260, 432, 206);
             _content.Controls.Add(_log);
         }
 
@@ -162,19 +270,60 @@ namespace WorkBuddyLauncher
 
         private void SetupTray()
         {
-            _tray.Icon = AppIcon.Value;
-            _tray.Text = LauncherPaths.AppName;
-            _tray.Visible = true;
-            _tray.DoubleClick += delegate { RestoreFromTray(); };
+            try
+            {
+                _tray.Icon = AppIcon.Value;
+                _tray.Text = LauncherPaths.AppName + " - 双击打开";
+                _tray.DoubleClick += delegate { RestoreFromTray(); };
 
-            var menu = new ContextMenuStrip();
-            menu.Items.Add("显示主窗口", null, delegate { RestoreFromTray(); });
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("查看初始管理员密码", null, OnShowInitialCredentials);
-            menu.Items.Add("重置关闭行为提示", null, OnResetCloseBehavior);
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add("退出启动器", null, OnTrayExit);
-            _tray.ContextMenuStrip = menu;
+                var menu = new ContextMenuStrip();
+                menu.Items.Add("显示主窗口", null, delegate { RestoreFromTray(); });
+                menu.Items.Add(new ToolStripSeparator());
+                menu.Items.Add("查看初始管理员密码", null, OnShowInitialCredentials);
+                menu.Items.Add("重置关闭行为提示", null, OnResetCloseBehavior);
+                menu.Items.Add(new ToolStripSeparator());
+                menu.Items.Add("退出启动器", null, OnTrayExit);
+                _tray.ContextMenuStrip = menu;
+                _trayReady = _trayInitializer(_tray);
+                if (!_trayReady)
+                {
+                    try { _tray.Visible = false; }
+                    catch { }
+                }
+            }
+            catch
+            {
+                _trayReady = false;
+                try { _tray.Visible = false; }
+                catch { }
+            }
+        }
+
+        public bool ShouldStartHidden
+        {
+            get { return _startedHidden && _trayReady; }
+        }
+
+        public bool AutostartRequested
+        {
+            get { return _startedHidden; }
+        }
+
+        public bool AutostartFailed { get; private set; }
+
+        /// 登录自启请求始终执行服务门；托盘可用时隐藏，否则立即显示窗口。
+        public void PrepareHiddenStart()
+        {
+            _autostartProbePending = true;
+            if (_trayReady)
+            {
+                ShowInTaskbar = false;
+                IntPtr unused = Handle;
+                ProbeAsync();
+                return;
+            }
+            ShowInTaskbar = true;
+            Show();
         }
 
         private string InitialCredentialsShownKey
@@ -197,6 +346,12 @@ namespace WorkBuddyLauncher
         /// 后续再次打开同一安装目录的启动器不会重复弹出。
         private void MaybeShowInitialCredentials()
         {
+            // 静默登录启动时不在用户桌面弹密码框；等用户主动唤醒窗口后再提示。
+            if (_startedHidden && !Visible)
+            {
+                _credentialPromptPending = true;
+                return;
+            }
             if (_settings.Get(InitialCredentialsShownKey, null) != null || _credentialLookupRunning) { return; }
             _credentialLookupRunning = true;
             string errLog = Path.Combine(Path.Combine(_root, "data"), "manager.err.log");
@@ -288,7 +443,32 @@ namespace WorkBuddyLauncher
             EnvConfig.ReadHostPort(LauncherPaths.EnvFilePath(_root), out _currentHost, out _currentPort);
             _txtHost.Text = _currentHost;
             _txtPort.Text = _currentPort.ToString();
+            _suppressAutoStartEvent = true;
+            try { _chkAutoStart.Checked = StartupRegistration.IsEnabledFor(_root); }
+            catch { _chkAutoStart.Checked = false; }
+            finally { _suppressAutoStartEvent = false; }
             UpdateAddressLabel();
+        }
+
+        private void OnAutoStartChanged(object sender, EventArgs e)
+        {
+            if (_suppressAutoStartEvent) { return; }
+            bool enabled = _chkAutoStart.Checked;
+            try
+            {
+                StartupRegistration.SetEnabled(_root, enabled);
+                AppendLog(enabled
+                    ? "[CFG] 已启用登录 Windows 时静默启动：" + StartupRegistration.CommandFor(_root)
+                    : "[CFG] 已关闭登录 Windows 时自动启动");
+            }
+            catch (Exception ex)
+            {
+                _suppressAutoStartEvent = true;
+                _chkAutoStart.Checked = !enabled;
+                _suppressAutoStartEvent = false;
+                MessageBox.Show(this, "更新开机自启设置失败：" + ex.Message,
+                    LauncherPaths.AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
 
         private string AddressUrl()
@@ -531,11 +711,26 @@ namespace WorkBuddyLauncher
         {
             if (_runner.IsRunning) { return; }
 
+            if (_autostartProbePending)
+            {
+                _autostartProbePending = false;
+                if (healthy)
+                {
+                    SetState(ProjectState.Running, null);
+                    AppendLog("[AUTO] 服务已在运行，无需重复启动。");
+                    MaybeShowInitialCredentials();
+                    return;
+                }
+                StartAutomaticService();
+                return;
+            }
+
             if (_wait == WaitKind.Healthy)
             {
                 if (healthy)
                 {
                     _wait = WaitKind.None;
+                    _autostartServicePending = false;
                     SetState(ProjectState.Running, null);
                     AppendLog("[OK] 服务已就绪：" + AddressUrl());
                     if (_openBrowserOnHealthy)
@@ -552,8 +747,15 @@ namespace WorkBuddyLauncher
                 {
                     _wait = WaitKind.None;
                     _openBrowserOnHealthy = false;
-                    SetState(ProjectState.Error, "启动超时");
-                    AppendLog("[ERROR] 等待健康检查超过 10 分钟，请查看上方输出日志排查。");
+                    if (_autostartServicePending)
+                    {
+                        ShowAutostartFailure("等待服务健康检查超过 10 分钟。");
+                    }
+                    else
+                    {
+                        SetState(ProjectState.Error, "启动超时");
+                        AppendLog("[ERROR] 等待健康检查超过 10 分钟，请查看上方输出日志排查。");
+                    }
                     return;
                 }
                 _lblState.Text = "启动中…（已等待 " + (int)seconds + " 秒）";
@@ -583,6 +785,84 @@ namespace WorkBuddyLauncher
 
             SetState(healthy ? ProjectState.Running : ProjectState.Stopped, null);
             if (healthy) { MaybeShowInitialCredentials(); }
+        }
+
+        /// 登录自启必须真正拉起面板与上游网关；任何失败都不能留下无提示的空托盘。
+        private void StartAutomaticService()
+        {
+            AutostartFailed = false;
+            string host = _txtHost.Text.Trim();
+            int port;
+            string error;
+            if (!EnvConfig.TryValidateHost(host, out error) ||
+                !EnvConfig.TryValidatePort(_txtPort.Text, out port, out error))
+            {
+                ShowAutostartFailure(error);
+                return;
+            }
+
+            string connectHost = EnvConfig.ToConnectHost(host);
+            try
+            {
+                if (_autostartGate.IsHealthy(connectHost, port))
+                {
+                    SetState(ProjectState.Running, null);
+                    AppendLog("[AUTO] 服务已在运行，无需重复启动。");
+                    MaybeShowInitialCredentials();
+                    return;
+                }
+                if (_autostartGate.IsPortInUse(connectHost, port))
+                {
+                    ShowAutostartFailure("端口 " + port + " 已被其他程序占用。");
+                    return;
+                }
+
+                _currentHost = host;
+                _currentPort = port;
+                _autostartServicePending = true;
+                SetState(ProjectState.Starting, "自动启动中…");
+                AppendLog("[AUTO] 登录自启正在准备环境并启动面板与上游网关…");
+                _autostartGate.Start(_root, AppendLogSafe, delegate(int code)
+                {
+                    BeginInvokeSafe(delegate
+                    {
+                        if (code != 0)
+                        {
+                            ShowAutostartFailure("服务启动脚本返回退出码 " + code + "。");
+                            return;
+                        }
+                        _wait = WaitKind.Healthy;
+                        _waitSince = DateTime.Now;
+                        _openBrowserOnHealthy = false;
+                        AppendLog("[AUTO] 服务进程已拉起，等待健康检查…");
+                        UpdateButtons();
+                    });
+                });
+            }
+            catch (Exception ex)
+            {
+                ShowAutostartFailure(ex.Message);
+            }
+        }
+
+        private void ShowAutostartFailure(string reason)
+        {
+            AutostartFailed = true;
+            _autostartServicePending = false;
+            _wait = WaitKind.None;
+            _openBrowserOnHealthy = false;
+            SetState(ProjectState.Error, "自动启动失败");
+            AppendLog("[ERROR] 登录自启未启动服务：" + reason);
+            WakeExistingInstance();
+            if (_trayReady)
+            {
+                try
+                {
+                    _tray.ShowBalloonTip(5000, LauncherPaths.AppName,
+                        "自动启动服务失败，主窗口已打开。", ToolTipIcon.Error);
+                }
+                catch { }
+            }
         }
 
         // ── 托盘与关闭行为 ────────────────────────────────────────
@@ -627,13 +907,20 @@ namespace WorkBuddyLauncher
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             _timer.Stop();
-            _tray.Visible = false;
+            try { _tray.Visible = false; }
+            catch { }
             _tray.Dispose();
             base.OnFormClosed(e);
         }
 
         private void HideToTray()
         {
+            if (!_trayReady)
+            {
+                MessageBox.Show(this, "系统托盘当前不可用，窗口将保持显示。",
+                    LauncherPaths.AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
             Hide();
             if (_settings.Get("tray_balloon_shown", null) == null)
             {
@@ -646,9 +933,30 @@ namespace WorkBuddyLauncher
 
         private void RestoreFromTray()
         {
+            WakeExistingInstance();
+        }
+
+        /// 可由托盘双击或第二实例的命名事件从任意线程调用。
+        public void WakeExistingInstance()
+        {
+            if (IsDisposed) { return; }
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(new Action(WakeExistingInstance)); }
+                catch { }
+                return;
+            }
+            _startedHidden = false;
+            ShowInTaskbar = true;
             Show();
             WindowState = FormWindowState.Normal;
             Activate();
+            BringToFront();
+            if (_credentialPromptPending)
+            {
+                _credentialPromptPending = false;
+                BeginInvoke(new Action(MaybeShowInitialCredentials));
+            }
         }
 
         private void OnResetCloseBehavior(object sender, EventArgs e)

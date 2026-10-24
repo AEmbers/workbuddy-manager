@@ -186,13 +186,14 @@ namespace WorkBuddyLauncher
         private void DoUninstall()
         {
             Report("正在关闭启动器窗口…");
-            Maintenance.CloseRunningLauncher();
+            Maintenance.CloseRunningLauncher(_installDir);
 
             Report("正在停止运行中的服务…");
             Maintenance.StopServices(_installDir);
 
             Report("正在删除快捷方式与注册表…");
-            Maintenance.RemoveShortcutsAndRegistry();
+            // 这里同时清理 HKCU\Run，避免卸载后登录时再启动已删除的程序。
+            Maintenance.RemoveShortcutsAndRegistry(_installDir);
 
             _totalFiles = Maintenance.CountFiles(_installDir);
             _progress.Maximum = Math.Max(_totalFiles, 1);

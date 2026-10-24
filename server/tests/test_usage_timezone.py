@@ -46,16 +46,23 @@ class UsageTimezone(unittest.TestCase):
         self._tmp.cleanup()
 
     def _seed(self, ts: int, pt: int = 100, ct: int = 50) -> None:
-        db.execute(
-            'INSERT INTO api_keys(name, key_hash, prefix, enabled, expires_at, max_ips, '
-            'ip_allowlist, models, quota, used_tokens, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-            ('k', 'h', 'wbk_abc', 1, None, 0, '[]', '[]', 0, 0, ts),
-        )
+        # 多次 seed 必须复用同一把逻辑密钥；key_hash 现在有数据库唯一约束，
+        # 不能再靠重复插入伪造同一个 key_id。
+        key = db.query_one('SELECT id FROM api_keys ORDER BY id LIMIT 1')
+        if key is None:
+            db.execute(
+                'INSERT INTO api_keys(name, key_hash, prefix, enabled, expires_at, max_ips, '
+                'ip_allowlist, models, quota, used_tokens, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                ('k', 'h', 'wbk_abc', 1, None, 0, '[]', '[]', 0, 0, ts),
+            )
+            key_id = 1
+        else:
+            key_id = int(key['id'])
         db.execute(
             'INSERT INTO request_logs(ts, key_id, ip, model, mapped_model, status, '
             'prompt_tokens, completion_tokens, latency_ms, ua, error, stream) '
             'VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-            (ts, 1, '1.2.3.4', 'glm-5.2', 'glm-5.2', 200, pt, ct, 10, 'ua', '', 0),
+            (ts, key_id, '1.2.3.4', 'glm-5.2', 'glm-5.2', 200, pt, ct, 10, 'ua', '', 0),
         )
 
     def _daily(self, ts: int, requests: int = 1, pt: int = 100, ct: int = 50) -> None:

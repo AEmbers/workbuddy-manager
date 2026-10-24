@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ipaddress
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -77,6 +78,10 @@ class KeyIn(BaseModel):
     # 版本归属：'' = 不限制（存量密钥的形态）。非 cn/global 的值由
     # keysvc._norm_realm 归一化成 ''——不报错，免得旧前端（不带该字段）被拒。
     realm: str = Field(default='', max_length=16)
+    # 新建时可选随机生成或由管理员指定；编辑接口不接受这两个字段，
+    # 因为密钥本体一旦写入就只保留哈希，不能再次读取或原地替换。
+    key_mode: Literal['random', 'custom'] = 'random'
+    custom_key: str | None = Field(default=None, max_length=256)
 
 
 class KeyPatch(BaseModel):
@@ -146,17 +151,23 @@ def create_key(body: KeyIn, request: Request,
     _check_name(body.name)
     _check_ip_allowlist(body.ip_allowlist)
     _check_upstream(body.upstream_id)
-    created = keysvc.create_key(
-        name=body.name,
-        expires_at=body.expires_at,
-        max_ips=body.max_ips,
-        ip_allowlist=body.ip_allowlist,
-        models=body.models,
-        quota=body.quota,
-        realm=body.realm,
-        quota_credit=body.quota_credit,
-        upstream_id=body.upstream_id,
-    )
+    try:
+        created = keysvc.create_key(
+            name=body.name,
+            expires_at=body.expires_at,
+            max_ips=body.max_ips,
+            ip_allowlist=body.ip_allowlist,
+            models=body.models,
+            quota=body.quota,
+            realm=body.realm,
+            quota_credit=body.quota_credit,
+            upstream_id=body.upstream_id,
+            custom_token=body.custom_key if body.key_mode == 'custom' else None,
+        )
+    except keysvc.InvalidCustomToken as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except keysvc.DuplicateToken as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
     # 密钥是拿额度用的凭证，发放必须留痕（含来源 IP）
     upstream_name = '默认上游'
     if created.get('upstream_id'):

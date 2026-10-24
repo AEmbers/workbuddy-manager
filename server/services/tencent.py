@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import calendar
+import codecs
+from contextlib import asynccontextmanager
 import json
 import os
 import re
@@ -16,6 +18,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -167,6 +170,24 @@ def _login_net_hint(proxy_name: str, exc: Exception) -> str:
             '换一条线路，或先在弹窗里关掉它再试'
         )
     return f'连不上腾讯登录接口：{detail}。请检查这台机器的网络出口（DNS 与外网连通性）'
+
+
+def _probe_base_url(realm: Realm, domain: str) -> tuple[str, str | None]:
+    """选择测活 base URL；自定义地址只允许 http(s)。
+
+    非 URL 的 domain 仍沿用 realm 的官方 base。自定义 URL 不封禁内网目标：
+    这是管理员显式配置的诊断能力，启动端点因此只接受真人会话。DNS 解析与
+    出站边界继续由 HTTPX / 账号代理完成，这里不另造一套网络策略。
+    """
+    raw = str(domain or '').strip()
+    if not raw:
+        return chat_base(realm), None
+    if '://' not in raw and not re.match(r'^[A-Za-z][A-Za-z0-9+.-]*:', raw):
+        return chat_base(realm), None
+    parsed = urlsplit(raw)
+    if parsed.scheme.lower() not in ('http', 'https') or not parsed.hostname:
+        return '', '自定义 base URL 只支持有效的 http:// 或 https:// 地址'
+    return raw.rstrip('/'), None
 
 
 async def start_login(realm: Realm = CN, proxy_name: str = '') -> dict:
@@ -1166,8 +1187,221 @@ def _package_expiry(item: dict) -> int | None:
     return int(naive.replace(tzinfo=_PACKAGE_END_TZ).timestamp())
 
 
-async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
-    """以最小**流式**对话请求探测账号可用性。
+def _probe_category(status: int, code: object) -> str:
+    """把测活响应归到稳定的机器可读类别。
+
+    矩阵 UI 不能靠 message 字符串猜结果：上游同一业务码可能以数字或带横线的
+    字符串出现，HTTP 402/401 还可能没有业务信封。分类只在这里做一次，单号
+    测活与矩阵探测因此使用同一口径。
+    """
+    try:
+        n = int(code)
+    except (TypeError, ValueError):
+        n = None
+    if n == 6004:
+        return 'rate_limited'
+    if status == 402 or n == 14018:
+        return 'quota_exhausted'
+    # 裸 429 没有业务码时同样是限流；这是上游最常见的 HTTP-only 形态。
+    if status == 429:
+        return 'rate_limited'
+    if status == 401 or n == 12153:
+        return 'unauthorized'
+    if n == 11102:
+        return 'model_unavailable'
+    # SSE 常以 HTTP 200 承载业务错误；未知非零业务码不能因此误判成功。
+    if n not in (None, 0) and status < 400:
+        return 'upstream_error'
+    if 200 <= status < 300:
+        return 'success'
+    if status >= 400:
+        return 'upstream_error'
+    return 'request_error'
+
+
+_PROBE_STREAM_LINE_MAX = 64 * 1024
+
+
+class ProbeBudgetExhausted(RuntimeError):
+    """The caller's hard cap on physical probe requests has been reached."""
+
+
+class ProbeRequestGate:
+    """Bound every physical probe request by a global budget and account spacing.
+
+    A logical account/model probe can use more than one HTTP request because a
+    channel-check rejection may fall back from ``/v2`` to ``/console``.  The
+    matrix must budget and throttle those *physical* attempts, not merely the
+    outer account/model loop.
+    """
+
+    def __init__(
+        self,
+        *,
+        limit: int,
+        min_interval_ms: int,
+        clock=None,
+        sleeper=None,
+    ) -> None:
+        self.limit = max(1, int(limit))
+        self.min_interval = max(0, int(min_interval_ms)) / 1000
+        self._clock = clock or time.monotonic
+        self._sleep = sleeper or asyncio.sleep
+        self._used = 0
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._last_finished: dict[str, float] = {}
+
+    @property
+    def used(self) -> int:
+        return self._used
+
+    @property
+    def exhausted(self) -> bool:
+        return self._used >= self.limit
+
+    @property
+    def exhausted_message(self) -> str:
+        return f'出站请求预算已耗尽（上限 {self.limit} 次）'
+
+    @asynccontextmanager
+    async def attempt(self, account_key: str):
+        """Reserve one physical request and keep one account strictly serial."""
+        key = str(account_key or 'unknown')
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        await lock.acquire()
+        try:
+            previous = self._last_finished.get(key)
+            if previous is not None:
+                wait = self.min_interval - (self._clock() - previous)
+                if wait > 0:
+                    await self._sleep(wait)
+            if self._used >= self.limit:
+                raise ProbeBudgetExhausted(self.exhausted_message)
+            # No await is allowed between the cap check and increment: concurrent
+            # accounts share this one hard budget.
+            self._used += 1
+            try:
+                yield
+            finally:
+                self._last_finished[key] = self._clock()
+        finally:
+            lock.release()
+
+
+@asynccontextmanager
+async def _probe_request_slot(
+    gate: ProbeRequestGate | None,
+    account_key: str,
+):
+    if gate is None:
+        yield
+        return
+    async with gate.attempt(account_key):
+        yield
+
+
+def _stream_event(text: str) -> tuple[str, tuple[object, str] | None]:
+    """解析一条完整 SSE/JSON 行，区分错误、首个数据事件和无意义行。"""
+    stripped = str(text or '').lstrip('\ufeff').strip()
+    if not stripped or stripped.startswith((':', 'event:', 'id:', 'retry:')):
+        return 'none', None
+    candidates: list[str] = []
+    if stripped.startswith('{'):
+        candidates.append(stripped)
+    if stripped.startswith('data:'):
+        data = stripped[5:].strip()
+        if data and data != '[DONE]':
+            candidates.append(data)
+    for raw in candidates:
+        try:
+            env = json.loads(raw)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(env, dict):
+            continue
+        error = env.get('error')
+        if isinstance(error, dict):
+            return 'error', (
+                error.get('code', -1),
+                str(error.get('message') or error.get('msg') or '上游返回错误'),
+            )
+        if 'code' in env and str(env.get('code')) not in ('0', 'None'):
+            return 'error', (
+                env.get('code'),
+                str(env.get('msg') or env.get('message') or ''),
+            )
+        return 'data', None
+    return 'none', None
+
+
+def _stream_error(chunk: bytes) -> tuple[object, str] | None:
+    """兼容旧调用：从单块文本里识别错误。"""
+    text = chunk.decode('utf-8', errors='replace')
+    for line in text.splitlines() or [text]:
+        kind, error = _stream_event(line)
+        if kind == 'error':
+            return error
+    return None
+
+
+async def _read_probe_stream(
+    resp: httpx.Response,
+) -> tuple[str, tuple[object, str] | None]:
+    """读取到首个完整数据/错误事件。
+
+    优先用 HTTPX 的 `aiter_lines()`；测试与替代 transport 没有这个方法时，
+    使用本请求私有缓冲保留半行。一个 6004 事件被网络拆成多块仍会等换行后再
+    分类，不会把前半块误判成可用。缓冲上限防止异常上游无限堆内存。
+    """
+    line_method = getattr(resp, 'aiter_lines', None)
+    if callable(line_method):
+        async for raw_line in line_method():
+            line = (raw_line.decode('utf-8', errors='replace')
+                    if isinstance(raw_line, bytes) else str(raw_line))
+            if len(line) > _PROBE_STREAM_LINE_MAX:
+                return 'oversize', None
+            kind, error = _stream_event(line)
+            if kind != 'none':
+                return kind, error
+        return 'none', None
+
+    buffer = ''
+    decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+    async for chunk in resp.aiter_bytes():
+        if not chunk:
+            continue
+        buffer += decoder.decode(chunk)
+        while '\n' in buffer:
+            line, buffer = buffer.split('\n', 1)
+            kind, error = _stream_event(line)
+            if kind != 'none':
+                return kind, error
+        if len(buffer) > _PROBE_STREAM_LINE_MAX:
+            return 'oversize', None
+    buffer += decoder.decode(b'', final=True)
+    if buffer:
+        kind, error = _stream_event(buffer)
+        if kind != 'none':
+            return kind, error
+    return 'none', None
+
+
+def _safe_probe_message(message: str, access_token: str) -> str:
+    """探测结果会进入任务快照；任何意外回显都必须先去掉访问令牌。"""
+    text = str(message or '')
+    if access_token:
+        text = text.replace(access_token, '[redacted]')
+    return re.sub(r'(?i)bearer\s+[A-Za-z0-9._~+/=-]+', 'Bearer [redacted]', text)
+
+
+async def probe_account_detailed(
+    auth: dict,
+    model: str = 'glm-5.2',
+    *,
+    request_gate: ProbeRequestGate | None = None,
+    request_account_key: str = '',
+) -> dict:
+    """以最小**流式**对话请求探测账号×模型，并返回结构化结果。
 
     必须用流式：上游强制要求 stream=true，非流式会返回
     code=11101「Non-stream chat request is currently not supported」
@@ -1183,14 +1417,24 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
 
     access_token = str(auth.get('access_token') or '')
     if not access_token:
-        return False, '该账号无有效 accessToken'
+        return {
+            'ok': False, 'category': 'request_error', 'code': None,
+            'message': '该账号无有效 accessToken', 'elapsed_ms': 0,
+        }
 
     realm = realm_of(auth)
     uid = str(auth.get('uid') or '')
     enterprise_id = str(auth.get('enterprise_id') or '')
     domain = str(auth.get('domain') or '')
-    # 账号自带的 domain 若已是完整 URL，说明部署方指定了 base，优先采用
-    base = domain if domain.startswith('http') else chat_base(realm)
+    # 账号自带的 domain 若已是完整 URL，说明部署方指定了 base，优先采用。
+    # 自定义目标只允许 http(s)，但不在这里封禁内网地址：这是管理员显式配置
+    # 的凭据型诊断能力，权限边界由启动接口的 require_session_admin 承担。
+    base, base_error = _probe_base_url(realm, domain)
+    if base_error:
+        return {
+            'ok': False, 'category': 'request_error', 'code': None,
+            'message': base_error, 'elapsed_ms': 0,
+        }
 
     headers = _hdr(realm, access_token, uid)
     # chat 是流式路径：Accept 覆盖为流式形态（对齐上游 D6 —— 非流式默认收紧为
@@ -1254,30 +1498,94 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
         # 不被并发的批量任务（刷积分/签到）挤到 pool 超时（issue #161）。
         async with _account_http_client(auth, lane='probe') as client:
             for idx, path in enumerate(paths):
-                async with client.stream(
-                    'POST', f'{base}{path}', json=payload, headers=headers,
-                ) as resp:
-                    if resp.status_code >= 400:
-                        raw = (await resp.aread()).decode('utf-8', errors='replace')
-                        code, msg = _parse_error_body(raw, resp.status_code)
-                        channel_check = _is_channel_check(code, raw)
-                        if channel_check and idx < len(paths) - 1:
-                            continue  # 换下一条路径再试，别当成账号问题
-                        if channel_check:
-                            # 两条都被拦：说清「不是账号问题」，否则用户会以为号坏了去重扫。
-                            return False, ('这次调用被上游的渠道校验拦下了（已试过 ' +
+                # Each candidate path is a physical outbound request.  The gate
+                # therefore lives inside this loop, not around the whole probe.
+                async with _probe_request_slot(
+                    request_gate, request_account_key or uid or access_token,
+                ):
+                    async with client.stream(
+                        'POST', f'{base}{path}', json=payload, headers=headers,
+                    ) as resp:
+                        if resp.status_code >= 400:
+                            raw = (await resp.aread()).decode('utf-8', errors='replace')
+                            code, msg = _parse_error_body(raw, resp.status_code)
+                            channel_check = _is_channel_check(code, raw)
+                            if channel_check and idx < len(paths) - 1:
+                                continue  # 换下一条路径再试，别当成账号问题
+                            if channel_check:
+                                # 两条都被拦：说清「不是账号问题」，否则用户会以为号坏了去重扫。
+                                message = ('这次调用被上游的渠道校验拦下了（已试过 ' +
                                            '/'.join(paths) + '）—— 账号本身没问题；'
                                            '请先升级到最新版本，仍不行就把这句反馈给维护者')
-                        return False, _explain_code(code, msg)
-                    # 读到首个非空数据块即可确认账号可用，无需等流结束
-                    async for chunk in resp.aiter_bytes():
-                        if chunk:
-                            elapsed = int((_time.time() - started) * 1000)
-                            return True, f'连通正常（{model}，{elapsed}ms）'
-                    return False, '上游未返回任何数据'
-        return False, '所有候选路径均不可用'
+                                return {
+                                    'ok': False, 'category': 'request_error',
+                                    'code': code, 'message': _safe_probe_message(message, access_token),
+                                    'elapsed_ms': int((_time.time() - started) * 1000),
+                                }
+                            category = _probe_category(resp.status_code, code)
+                            return {
+                                'ok': False,
+                                'category': category,
+                                'code': code,
+                                'message': _safe_probe_message(_explain_code(code, msg), access_token),
+                                'elapsed_ms': int((_time.time() - started) * 1000),
+                            }
+                        # 读到首个完整事件即可判断，无需等流结束。半行会留在本请求
+                        # 私有缓冲中，保证 6004 被网络拆包时不会先误判成功。
+                        kind, stream_error = await _read_probe_stream(resp)
+                        elapsed = int((_time.time() - started) * 1000)
+                        if kind == 'error' and stream_error is not None:
+                            code, msg = stream_error
+                            category = _probe_category(resp.status_code, code)
+                            return {
+                                'ok': False, 'category': category, 'code': code,
+                                'message': _safe_probe_message(
+                                    _explain_code(code, msg), access_token),
+                                'elapsed_ms': elapsed,
+                            }
+                        if kind == 'oversize':
+                            return {
+                                'ok': False, 'category': 'request_error', 'code': None,
+                                'message': (
+                                    '上游流式响应单行超过 64 KiB，无法安全判定；'
+                                    '请重试或检查上游代理'
+                                ),
+                                'elapsed_ms': elapsed,
+                            }
+                        if kind == 'data':
+                            return {
+                                'ok': True, 'category': 'success', 'code': 200,
+                                'message': f'连通正常（{model}，{elapsed}ms）',
+                                'elapsed_ms': elapsed,
+                            }
+                        return {
+                            'ok': False, 'category': 'request_error', 'code': None,
+                            'message': '上游未返回任何数据',
+                            'elapsed_ms': int((_time.time() - started) * 1000),
+                        }
+        return {
+            'ok': False, 'category': 'request_error', 'code': None,
+            'message': '所有候选路径均不可用',
+            'elapsed_ms': int((_time.time() - started) * 1000),
+        }
+    except ProbeBudgetExhausted as exc:
+        return {
+            'ok': False, 'category': 'budget_exhausted', 'code': None,
+            'message': str(exc),
+            'elapsed_ms': int((_time.time() - started) * 1000),
+        }
     except Exception as exc:  # noqa: BLE001
-        return False, f'请求异常: {err_text(exc)}'
+        return {
+            'ok': False, 'category': 'request_error', 'code': None,
+            'message': _safe_probe_message(f'请求异常: {err_text(exc)}', access_token),
+            'elapsed_ms': int((_time.time() - started) * 1000),
+        }
+
+
+async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
+    """兼容原有单号测活契约；矩阵和单号接口共用结构化实现。"""
+    result = await probe_account_detailed(auth, model)
+    return bool(result.get('ok')), str(result.get('message') or '')
 
 
 
@@ -1314,6 +1622,8 @@ def _parse_error_body(raw: str, status: int) -> tuple[int | str, str]:
 _CODE_HINTS: dict[int | str, str] = {
     0: '成功',
     10001: '今日已签到',
+    6004: '该模型暂时被限流',
+    11102: '该账号没有这个模型',
     11101: '上游不接受非流式请求（协议问题，非账号问题）',
     # 14018：上游 2026-09-20 起把它明确归为「积分耗尽」（只认这个结构化业务码，
     # 不靠文案猜——429 上「额度不足」的措辞跨计费与限流两界）。本端跟着翻译：

@@ -11,6 +11,56 @@ from . import db
 from .iputil import ip_matches
 
 TOKEN_PREFIX = 'wbk_'
+CUSTOM_TOKEN_MIN_LENGTH = 16
+CUSTOM_TOKEN_MAX_LENGTH = 256
+RANDOM_TOKEN_MAX_ATTEMPTS = 5
+
+
+class InvalidCustomToken(ValueError):
+    """The administrator supplied a token that cannot safely be sent as a bearer key."""
+
+
+class DuplicateToken(ValueError):
+    """The requested custom token is already assigned to another key."""
+
+
+class TokenGenerationError(RuntimeError):
+    """A random token could not be inserted after bounded collision retries."""
+
+
+def normalize_custom_token(value: object) -> str:
+    """Validate and normalize an administrator-supplied bearer token.
+
+    Custom keys intentionally need not start with ``wbk_`` so existing provider
+    keys can be moved into the manager. They still have to be printable ASCII
+    without whitespace, because HTTP bearer parsing and several clients trim or
+    reject anything else.
+    """
+
+    token = str(value or '').strip()
+    if len(token) < CUSTOM_TOKEN_MIN_LENGTH:
+        raise InvalidCustomToken(
+            f'自定义密钥至少需要 {CUSTOM_TOKEN_MIN_LENGTH} 个字符'
+        )
+    if len(token) > CUSTOM_TOKEN_MAX_LENGTH:
+        raise InvalidCustomToken(
+            f'自定义密钥不能超过 {CUSTOM_TOKEN_MAX_LENGTH} 个字符'
+        )
+    if any(ord(ch) < 33 or ord(ch) > 126 for ch in token):
+        raise InvalidCustomToken('自定义密钥只能包含可见 ASCII 字符，不能含空格')
+    return token
+
+
+def _token_hash_exists(token_hash: str, conn: sqlite3.Connection | None = None) -> bool:
+    sql = 'SELECT 1 FROM api_keys WHERE key_hash = ? LIMIT 1'
+    row = (conn.execute(sql, (token_hash,)).fetchone() if conn is not None
+           else db.query_one(sql, (token_hash,)))
+    return row is not None
+
+
+def _is_key_hash_conflict(exc: sqlite3.IntegrityError) -> bool:
+    message = str(exc).lower()
+    return 'unique constraint failed' in message and 'api_keys.key_hash' in message
 
 
 class Rejection(str):
@@ -217,6 +267,7 @@ def create_key(
     realm: str = '',
     quota_credit: float = 0,
     upstream_id: int | None = None,
+    custom_token: str | None = None,
     *,
     _conn: sqlite3.Connection | None = None,
 ) -> dict:
@@ -230,30 +281,52 @@ def create_key(
     之所以做成参数而不是让红包自己写一份 INSERT：SQL 抄第二遍就是第二份事实，
     改一处漏一处——本项目在 count_tokens 的鉴权上正是这么漂移出真漏洞的。
     """
-    token = TOKEN_PREFIX + secrets.token_urlsafe(32)
+    normalized_custom = None
+    if custom_token is not None:
+        normalized_custom = normalize_custom_token(custom_token)
+        if _token_hash_exists(_hash(normalized_custom), _conn):
+            raise DuplicateToken('这把自定义密钥已经存在，请换一个值')
+
     sql = ('INSERT INTO api_keys(name, key_hash, prefix, enabled, expires_at, max_ips, '
            'ip_allowlist, models, realm, quota, used_tokens, quota_credit, used_credit, '
            'created_at, upstream_id) VALUES(?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)')
-    args = (
-        name,
-        _hash(token),
-        token[:12],
-        expires_at,
-        max_ips,
-        json.dumps(_norm_cidrs(ip_allowlist)),
-        json.dumps(models or []),
-        _norm_realm(realm),
-        quota,
-        _norm_credit_quota(quota_credit),
-        int(time.time()),
-        _norm_upstream_id(upstream_id),
-    )
-    if _conn is not None:
-        key_id = int(_conn.execute(sql, args).lastrowid or 0)
-        row = _conn.execute('SELECT * FROM api_keys WHERE id = ?', (key_id,)).fetchone()
-    else:
-        key_id = db.execute(sql, args)
-        row = db.query_one('SELECT * FROM api_keys WHERE id = ?', (key_id,))
+    attempts = 1 if normalized_custom is not None else RANDOM_TOKEN_MAX_ATTEMPTS
+    for attempt in range(attempts):
+        token = (normalized_custom if normalized_custom is not None else
+                 TOKEN_PREFIX + secrets.token_urlsafe(32))
+        args = (
+            name,
+            _hash(token),
+            token[:12],
+            expires_at,
+            max_ips,
+            json.dumps(_norm_cidrs(ip_allowlist)),
+            json.dumps(models or []),
+            _norm_realm(realm),
+            quota,
+            _norm_credit_quota(quota_credit),
+            int(time.time()),
+            _norm_upstream_id(upstream_id),
+        )
+        try:
+            if _conn is not None:
+                key_id = int(_conn.execute(sql, args).lastrowid or 0)
+                row = _conn.execute(
+                    'SELECT * FROM api_keys WHERE id = ?', (key_id,)
+                ).fetchone()
+            else:
+                key_id = db.execute(sql, args)
+                row = db.query_one('SELECT * FROM api_keys WHERE id = ?', (key_id,))
+            break
+        except sqlite3.IntegrityError as exc:
+            if not _is_key_hash_conflict(exc):
+                raise
+            if normalized_custom is not None:
+                raise DuplicateToken('这把自定义密钥已经存在，请换一个值') from exc
+            if attempt + 1 == attempts:
+                raise TokenGenerationError(
+                    f'随机密钥连续 {attempts} 次与已有密钥冲突，已停止重试'
+                ) from exc
     out = _parse(row)
     out['key'] = token  # 仅此一次返回明文
     return out
@@ -322,7 +395,8 @@ def reset_usage(key_id: int) -> bool:
 
 def resolve(token: str) -> dict | None:
     """按前缀定位后比对哈希，避免全表扫描。"""
-    if not token or not token.startswith(TOKEN_PREFIX):
+    token = str(token or '').strip()
+    if not token or len(token) > CUSTOM_TOKEN_MAX_LENGTH:
         return None
     rows = db.query('SELECT * FROM api_keys WHERE prefix = ?', (token[:12],))
     digest = _hash(token)

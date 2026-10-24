@@ -11,7 +11,12 @@
  * （数字照样有、日期也像个日期，只是歸到了一天前）。这类错误没有运行时
  * 断言就只能等用户发现。
  */
-import {groupExpiriesByDay} from './display-prefs.ts';
+import {
+  getCreditsFlowChartMode,
+  groupExpiriesByDay,
+  setCreditsFlowChartMode,
+} from './display-prefs.ts';
+import {readFileSync} from 'node:fs';
 
 let failed = 0;
 
@@ -30,6 +35,34 @@ function check(name, got, want) {
 function localNoon(y, m, d) {
   return Math.floor(new Date(y, m - 1, d, 12, 0, 0).getTime() / 1000);
 }
+
+console.log('credits flow chart preference:');
+const previousWindow = globalThis.window;
+const stored = new Map();
+globalThis.window = {
+  localStorage: {
+    getItem: (key) => stored.get(key) ?? null,
+    setItem: (key, value) => stored.set(key, String(value)),
+  },
+};
+check('defaults to line', getCreditsFlowChartMode(), 'line');
+setCreditsFlowChartMode('bar');
+check('stores bar', getCreditsFlowChartMode(), 'bar');
+setCreditsFlowChartMode('line');
+check('stores line', getCreditsFlowChartMode(), 'line');
+if (previousWindow === undefined) delete globalThis.window;
+else globalThis.window = previousWindow;
+
+// 单日数据只有一个点，Recharts 的 Line 在 dot=false 时不会画出任何东西。
+// 柱状图的净增线、折线图的收入/支出线都必须为单点保留 marker。
+const dashboardSource = readFileSync(
+  new URL('../app/(main)/dashboard/page.tsx', import.meta.url),
+  'utf8',
+);
+const singlePointDots = dashboardSource.match(
+  /dot=\{flow\.daily\.length === 1 \? \{r: 3\} : false\}/g,
+) ?? [];
+check('all flow series show a single-day point', singlePointDots.length, 3);
 
 console.log('groupExpiriesByDay:');
 

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -13,16 +14,21 @@ namespace WorkBuddyLauncher
     /// 覆盖安装前的旧程序清理、卸载时的服务停止与残留清除都走这里，保证两处行为一致。
     internal static class Maintenance
     {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern uint GetLongPathName(string shortPath, StringBuilder longPath, uint length);
+
         /// 保留数据白名单（相对安装根；覆盖安装与卸载的「保留数据」都按它跳过）。
         public static readonly string[] KeepPaths = { ".env", "data", "upstream\\auths", "upstream\\config.json" };
 
-        /// 结束正在运行的控制窗口（WorkBuddyManager.exe）。
-        public static void CloseRunningLauncher()
+        /// 只结束指定安装目录里的控制窗口；其他副本可能正在服务另一套数据，不能误杀。
+        public static void CloseRunningLauncher(string installDir)
         {
+            string expected = Path.Combine(installDir, LauncherPaths.AppExeName);
             foreach (Process process in Process.GetProcessesByName("WorkBuddyManager"))
             {
                 try
                 {
+                    if (!PathsEqual(process.MainModule.FileName, expected)) { continue; }
                     process.CloseMainWindow();
                     if (!process.WaitForExit(3000)) { process.Kill(); process.WaitForExit(3000); }
                 }
@@ -41,19 +47,79 @@ namespace WorkBuddyLauncher
             }
         }
 
-        /// 删除桌面 / 开始菜单快捷方式与注册表卸载项。
-        public static void RemoveShortcutsAndRegistry()
+        /// 删除属于当前安装目录的快捷方式、卸载项与 Run 值。
+        public static void RemoveShortcutsAndRegistry(string installDir)
         {
-            TryDeleteFile(Path.Combine(
+            DeleteShortcutIfOwned(Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
-                LauncherPaths.AppName + ".lnk"));
+                LauncherPaths.AppName + ".lnk"), installDir);
             string menuDir = LauncherPaths.StartMenuFolder;
-            TryDeleteFile(Path.Combine(menuDir, LauncherPaths.AppName + ".lnk"));
-            TryDeleteFile(Path.Combine(menuDir, "卸载 " + LauncherPaths.AppName + ".lnk"));
+            DeleteShortcutIfOwned(Path.Combine(menuDir, LauncherPaths.AppName + ".lnk"), installDir);
+            DeleteShortcutIfOwned(Path.Combine(menuDir, "卸载 " + LauncherPaths.AppName + ".lnk"), installDir);
             try { Directory.Delete(menuDir, false); }
             catch { }
-            try { Registry.CurrentUser.DeleteSubKeyTree(LauncherPaths.UninstallRegKey, false); }
+            try { StartupRegistration.Disable(installDir); }
             catch { }
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(LauncherPaths.UninstallRegKey, false))
+                {
+                    string owner = key == null ? null : key.GetValue("InstallLocation") as string;
+                    if (PathsEqual(owner, installDir))
+                    {
+                        Registry.CurrentUser.DeleteSubKeyTree(LauncherPaths.UninstallRegKey, false);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static void DeleteShortcutIfOwned(string shortcutPath, string installDir)
+        {
+            if (!File.Exists(shortcutPath)) { return; }
+            try
+            {
+                Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null) { return; }
+                dynamic shell = Activator.CreateInstance(shellType);
+                dynamic shortcut = shell.CreateShortcut(shortcutPath);
+                string target = Convert.ToString(shortcut.TargetPath);
+                if (PathsEqual(target, Path.Combine(installDir, LauncherPaths.AppExeName)) ||
+                    PathsEqual(target, Path.Combine(installDir, LauncherPaths.UninstallExeName)))
+                {
+                    TryDeleteFile(shortcutPath);
+                }
+            }
+            catch
+            {
+                // 快捷方式归属读不出来时 fail closed：宁可留下入口，也不删除其他副本的入口。
+            }
+        }
+
+        private static bool PathsEqual(string left, string right)
+        {
+            if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right)) { return false; }
+            try
+            {
+                return string.Equals(
+                    NormalizePath(left),
+                    NormalizePath(right),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string NormalizePath(string path)
+        {
+            string full = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
+            var buffer = new StringBuilder(4096);
+            uint length = GetLongPathName(full, buffer, (uint)buffer.Capacity);
+            return length > 0 && length < buffer.Capacity
+                ? buffer.ToString().TrimEnd(Path.DirectorySeparatorChar)
+                : full;
         }
 
         /// 删除结果：删了几个、失败几个、**保留**了几个（不属于本程序的文件）。

@@ -6,6 +6,7 @@ import datetime
 import io
 import json
 import logging
+import math
 import shutil
 import time
 import zipfile
@@ -1685,13 +1686,33 @@ def upstream_logs(limit: int = 200, user: dict = Depends(security.current_user))
 
 @router.post('/accounts/{filename}/test')
 async def account_test(filename: str, upstream_id: int | None = Query(None),
-                       user: dict = Depends(security.require_admin)) -> dict:
+                       user: dict = Depends(security.require_session_admin)) -> dict:
     raw = _load(filename, _require_dir(_group(upstream_id)))
-    acct = raw.get('account') or {}
-    auth = raw.get('auth') or {}
     # 探测需要 uid / enterpriseId / domain 以复刻上游请求头，
     # device_token 用于 X-Device-Token（上游 chat 域同样注入）
-    ok, message = await tencent.probe_account({
+    return await tencent.probe_account_detailed(_probe_auth(raw))
+
+
+# ── 账号 × 模型主动探测矩阵（issue #270）─────────────────────
+#
+# 账号安全边界优先于“跑得快”：同一账号只有一个 worker，严格串行；相邻请求
+# 从上一请求结束到下一请求开始至少间隔 500ms。不同账号才允许有限并发。
+# 一次只保留一个活动任务，防止两个浏览器窗口重复点击把同一池子的请求量翻倍。
+_PROBE_MATRIX_MAX_ACCOUNTS = 100
+_PROBE_MATRIX_MAX_MODELS = 50
+_PROBE_MATRIX_MAX_CALLS = 1000
+_PROBE_MATRIX_MAX_CONCURRENCY = 4
+_PROBE_MATRIX_MIN_INTERVAL_MS = 500
+
+_probe_matrix_job: dict | None = None
+_probe_matrix_task: asyncio.Task | None = None
+
+
+def _probe_auth(raw: dict) -> dict:
+    """从账号文件提取测活所需字段；凭证只进入进程内任务，不进入响应快照。"""
+    acct = raw.get('account') or {}
+    auth = raw.get('auth') or {}
+    return {
         'access_token': auth.get('accessToken', ''),
         'uid': acct.get('uid', ''),
         'enterprise_id': acct.get('enterpriseId', ''),
@@ -1699,8 +1720,358 @@ async def account_test(filename: str, upstream_id: int | None = Query(None),
         'realm': auth.get('realm'),
         'device_token': str(raw.get('device_token') or ''),
         'proxy': str(raw.get('proxy') or ''),
-    })
-    return {'ok': ok, 'message': message}
+    }
+
+
+def _probe_model_name(value: object) -> str:
+    """矩阵输入用不带 realm 前缀的展示名；实际请求名由账号 realm 决定。"""
+    name = str(value or '').strip()
+    if name.lower().startswith('cn:'):
+        name = name[3:].strip()
+    elif name.lower().startswith('global:'):
+        name = name[7:].strip()
+    return name
+
+
+def _probe_request_model(name: str, realm: str) -> str:
+    """国内版裸名、国际版 global: 前缀——与上游 resolveModel 协议一致。"""
+    return f'global:{name}' if realm == 'global' else name
+
+
+def _probe_result_key(file: str, realm: str, model: str) -> str:
+    return f'{file}\0{realm}\0{model}'
+
+
+def _probe_matrix_active(job: dict | None = None) -> bool:
+    target = _probe_matrix_job if job is None else job
+    return bool(target and target.get('state') in ('queued', 'running', 'cancelling'))
+
+
+def _probe_matrix_progress(job: dict) -> dict:
+    results = list(job['results'].values())
+    completed = sum(1 for r in results if r['status'] not in ('pending', 'running'))
+    succeeded = sum(1 for r in results if r['status'] == 'success')
+    running = sum(1 for r in results if r['status'] == 'running')
+    return {
+        'total': len(results),
+        'completed': completed,
+        'succeeded': succeeded,
+        'failed': completed - succeeded,
+        'pending': max(0, len(results) - completed - running),
+        'running': running,
+    }
+
+
+def _probe_matrix_snapshot(job: dict) -> dict:
+    """只返回显式白名单字段。账号 auth/token 永远不进入这个快照。"""
+    interval_seconds = int(job['request_interval_ms']) / 1000
+    waves = math.ceil(len(job['accounts']) / int(job['account_concurrency']))
+    estimated_seconds = math.ceil(waves * len(job['model_names']) * interval_seconds)
+    gate = job.get('_request_gate')
+    return {
+        'job_id': str(job['job_id']),
+        'state': str(job['state']),
+        'accounts': [
+            {'file': a['file'], 'nickname': a['nickname'], 'realm': a['realm']}
+            for a in job['accounts']
+        ],
+        'models': list(job['model_names']),
+        'account_concurrency': int(job['account_concurrency']),
+        'request_interval_ms': int(job['request_interval_ms']),
+        'request_budget': int(getattr(gate, 'limit', _PROBE_MATRIX_MAX_CALLS)),
+        'requests_used': int(getattr(gate, 'used', 0)),
+        'estimated_seconds': estimated_seconds,
+        'progress': _probe_matrix_progress(job),
+        'results': [dict(item) for item in job['results'].values()],
+        'created_at': float(job['created_at']),
+        'finished_at': job.get('finished_at'),
+        'error': job.get('error'),
+    }
+
+
+def _scrub_probe_matrix_auth(job: dict) -> None:
+    """终态后不再保留任何凭证；任务结果已经只含展示与错误分类。"""
+    for account in job.get('accounts') or []:
+        account['_auth'] = {}
+
+
+def _new_probe_matrix_job(
+    accounts: list[dict],
+    model_names: list[str],
+    account_concurrency: int,
+    request_interval_ms: int,
+) -> dict:
+    results = {}
+    for account in accounts:
+        for model in model_names:
+            key = _probe_result_key(account['file'], account['realm'], model)
+            results[key] = {
+                'account_file': account['file'],
+                'nickname': account['nickname'],
+                'realm': account['realm'],
+                'model': model,
+                'request_model': _probe_request_model(model, account['realm']),
+                'status': 'pending',
+                'code': None,
+                'message': '',
+                'elapsed_ms': 0,
+            }
+    return {
+        'job_id': f'probe-{time.time_ns():x}',
+        'state': 'queued',
+        'accounts': accounts,
+        'model_names': model_names,
+        'account_concurrency': account_concurrency,
+        'request_interval_ms': request_interval_ms,
+        'results': results,
+        'created_at': time.time(),
+        'finished_at': None,
+        'error': None,
+    }
+
+
+def _abort_pending_probe_results(
+    job: dict,
+    message: str,
+    *,
+    status: str = 'request_error',
+) -> int:
+    count = 0
+    for result in job['results'].values():
+        if result['status'] in ('pending', 'running'):
+            result.update({
+                'status': status,
+                'code': None,
+                'message': message,
+                'elapsed_ms': 0,
+            })
+            count += 1
+    return count
+
+
+async def _run_probe_matrix_job(job: dict, probe=None) -> None:
+    """执行矩阵；测试可注入 probe，生产调用结构化测活实现。"""
+    probe = probe or tencent.probe_account_detailed
+    semaphore = asyncio.Semaphore(int(job['account_concurrency']))
+    interval = int(job['request_interval_ms']) / 1000
+    request_gate = tencent.ProbeRequestGate(
+        limit=_PROBE_MATRIX_MAX_CALLS,
+        min_interval_ms=int(job['request_interval_ms']),
+    )
+    job['_request_gate'] = request_gate
+
+    async def probe_account_worker(account: dict) -> None:
+        async with semaphore:
+            for index, model in enumerate(job['model_names']):
+                if job['state'] in ('cancelling', 'cancelled'):
+                    return
+                if index:
+                    # 从**上一请求结束**到下一请求开始计时；严格串行由这个循环保证。
+                    await asyncio.sleep(interval)
+                if job['state'] in ('cancelling', 'cancelled'):
+                    return
+                key = _probe_result_key(account['file'], account['realm'], model)
+                result = job['results'][key]
+                result['status'] = 'running'
+                try:
+                    outcome = await probe(
+                        account['_auth'],
+                        _probe_request_model(model, account['realm']),
+                        request_gate=request_gate,
+                        request_account_key=account['file'],
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    outcome = {
+                        'ok': False,
+                        'category': 'request_error',
+                        'code': None,
+                        'message': f'请求异常: {type(exc).__name__}',
+                        'elapsed_ms': 0,
+                    }
+                category = str(outcome.get('category') or
+                               ('success' if outcome.get('ok') else 'request_error'))
+                if job['state'] in ('cancelling', 'cancelled'):
+                    result.update({'status': 'cancelled', 'message': '任务已取消'})
+                    return
+                result.update({
+                    'status': category,
+                    'code': outcome.get('code'),
+                    'message': str(outcome.get('message') or ''),
+                    'elapsed_ms': max(0, int(outcome.get('elapsed_ms') or 0)),
+                })
+                if category == 'budget_exhausted':
+                    return
+
+    job['state'] = 'running'
+    workers: list[asyncio.Task] = []
+    try:
+        workers = [
+            asyncio.create_task(probe_account_worker(account))
+            for account in job['accounts']
+        ]
+        await asyncio.gather(*workers)
+    except asyncio.CancelledError:
+        job['state'] = 'cancelled'
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        raise
+    except Exception:  # noqa: BLE001
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+        logger.exception('账号×模型探测任务异常终止 job=%s', job.get('job_id'))
+        job['state'] = 'failed'
+        job['error'] = '探测任务因内部异常终止，请重新发起'
+        _abort_pending_probe_results(job, job['error'])
+    else:
+        job['state'] = 'cancelled' if job['state'] == 'cancelling' else 'finished'
+    finally:
+        # 无论正常、取消还是未预期异常都必须进入终态，避免页面永久轮询、
+        # 启动接口永久返回 409。凭证也只活到任务终态。
+        if job['state'] in ('queued', 'running', 'cancelling'):
+            job['state'] = 'failed'
+            job['error'] = job.get('error') or '探测任务异常终止'
+            _abort_pending_probe_results(job, job['error'])
+        elif request_gate.exhausted:
+            remaining = _abort_pending_probe_results(
+                job,
+                request_gate.exhausted_message,
+                status='budget_exhausted',
+            )
+            if remaining:
+                job['error'] = request_gate.exhausted_message
+        job['finished_at'] = time.time()
+        _scrub_probe_matrix_auth(job)
+
+
+@router.post('/accounts/probe-matrix')
+async def probe_matrix_start(
+    body: dict = Body(...),
+    user: dict = Depends(security.require_session_admin),
+) -> dict:
+    """启动账号 × 模型矩阵探测；返回可轮询的任务快照。
+
+    这是**管理员凭据型出站能力**：每个账号会以其 accessToken 请求模型端点，
+    自定义 base URL 又允许管理员把目标指向内网服务。因此启动动作只接受真人
+    会话，不接受 API Token；轮询与取消不携带新凭据，可继续接受管理员令牌。
+    """
+    global _probe_matrix_job, _probe_matrix_task
+    if _probe_matrix_active():
+        raise HTTPException(
+            status_code=409,
+            detail=f'已有探测任务正在运行（{_probe_matrix_job["job_id"]}），请先取消或等待完成',
+        )
+
+    upstream_id = body.get('upstream_id')
+    if upstream_id in (None, ''):
+        upstream_id = None
+    elif isinstance(upstream_id, bool):
+        raise HTTPException(status_code=400, detail='upstream_id 必须是整数')
+    else:
+        try:
+            upstream_id = int(upstream_id)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail='upstream_id 必须是整数') from exc
+    group = _group(upstream_id)
+    base_dir = _require_dir(group)
+
+    raw_files = body.get('files')
+    raw_models = body.get('models')
+    if not isinstance(raw_files, list) or not raw_files:
+        raise HTTPException(status_code=400, detail='至少选择一个账号')
+    if not isinstance(raw_models, list) or not raw_models:
+        raise HTTPException(status_code=400, detail='至少选择一个模型')
+
+    files: list[str] = []
+    for item in raw_files:
+        value = str(item or '').strip()
+        if value and value not in files:
+            files.append(value)
+    models: list[str] = []
+    for item in raw_models:
+        value = _probe_model_name(item)
+        if value and value not in models:
+            models.append(value)
+    if not files or not models:
+        raise HTTPException(status_code=400, detail='账号和模型不能为空')
+    if len(files) > _PROBE_MATRIX_MAX_ACCOUNTS:
+        raise HTTPException(status_code=400,
+                            detail=f'一次最多探测 {_PROBE_MATRIX_MAX_ACCOUNTS} 个账号')
+    if len(models) > _PROBE_MATRIX_MAX_MODELS:
+        raise HTTPException(status_code=400,
+                            detail=f'一次最多探测 {_PROBE_MATRIX_MAX_MODELS} 个模型')
+    if len(files) * len(models) > _PROBE_MATRIX_MAX_CALLS:
+        raise HTTPException(status_code=400,
+                            detail=f'一次最多发送 {_PROBE_MATRIX_MAX_CALLS} 个探测请求')
+
+    try:
+        concurrency = int(body.get('account_concurrency', 2))
+        interval_ms = int(body.get('request_interval_ms', _PROBE_MATRIX_MIN_INTERVAL_MS))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail='并发数与请求间隔必须是整数') from exc
+    if not 1 <= concurrency <= _PROBE_MATRIX_MAX_CONCURRENCY:
+        raise HTTPException(
+            status_code=400,
+            detail=f'账号并发必须在 1–{_PROBE_MATRIX_MAX_CONCURRENCY} 之间',
+        )
+    if not _PROBE_MATRIX_MIN_INTERVAL_MS <= interval_ms <= 5000:
+        raise HTTPException(status_code=400, detail='同账号请求间隔必须在 500–5000ms 之间')
+
+    accounts = []
+    for filename in files:
+        raw = _load(filename, base_dir)
+        auth = _probe_auth(raw)
+        acct = raw.get('account') or {}
+        accounts.append({
+            'file': filename,
+            'nickname': str(acct.get('nickname') or acct.get('uid') or filename),
+            'realm': realm_of(auth),
+            '_auth': auth,
+        })
+
+    job = _new_probe_matrix_job(accounts, models, concurrency, interval_ms)
+    _probe_matrix_job = job
+    _probe_matrix_task = asyncio.create_task(_run_probe_matrix_job(job))
+    security.audit(
+        user, 'accounts.probe_matrix', group['name'],
+        f'启动 {len(accounts)} 账号 × {len(models)} 模型，共 {len(accounts) * len(models)} 次请求',
+    )
+    return _probe_matrix_snapshot(job)
+
+
+@router.get('/accounts/probe-matrix/{job_id}')
+async def probe_matrix_status(
+    job_id: str,
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    if not _probe_matrix_job or _probe_matrix_job['job_id'] != job_id:
+        raise HTTPException(status_code=404, detail='探测任务不存在或已被新任务替换')
+    return _probe_matrix_snapshot(_probe_matrix_job)
+
+
+@router.post('/accounts/probe-matrix/{job_id}/cancel')
+async def probe_matrix_cancel(
+    job_id: str,
+    user: dict = Depends(security.require_admin),
+) -> dict:
+    job = _probe_matrix_job
+    if not job or job['job_id'] != job_id:
+        raise HTTPException(status_code=404, detail='探测任务不存在或已被新任务替换')
+    if _probe_matrix_active(job):
+        job['state'] = 'cancelling'
+        for result in job['results'].values():
+            if result['status'] in ('pending', 'running'):
+                result['status'] = 'cancelled'
+                result['message'] = '任务已取消'
+        if _probe_matrix_task and not _probe_matrix_task.done():
+            _probe_matrix_task.cancel()
+        _scrub_probe_matrix_auth(job)
+        job['state'] = 'cancelled'
+        job['finished_at'] = time.time()
+    return _probe_matrix_snapshot(job)
 
 
 async def _refresh_one_token(filename: str, base_dir: Path) -> dict:

@@ -10,6 +10,7 @@ import type {
   DailyTask,
   CreditsFlow,
   ApiKey,
+  ApiKeyCreate,
   ApiToken,
   AuditLogPage,
   Changelog,
@@ -42,6 +43,7 @@ import type {
   PgSyncStatus,
   PgSyncTestResult,
   PlaygroundModels,
+  ProbeMatrixJob,
   RedPacket,
   RedPacketDetail,
   RedPacketKind,
@@ -311,6 +313,20 @@ export const accountApi = {
   test: (file: string, upstreamId?: number | null) =>
     post<{ok: boolean; message: string}>(
       `/api/accounts/${encodeURIComponent(file)}/test${groupQs(upstreamId)}`),
+  /** 启动账号 × 模型矩阵探测；后端同一时刻只接受一个活动任务。 */
+  startProbeMatrix: (body: {
+    files: string[];
+    models: string[];
+    upstream_id?: number | null;
+    account_concurrency: number;
+    request_interval_ms: number;
+  }) => post<ProbeMatrixJob>('/api/accounts/probe-matrix', body),
+  probeMatrix: (jobId: string) =>
+    get<ProbeMatrixJob>(
+      `/api/accounts/probe-matrix/${encodeURIComponent(jobId)}`),
+  cancelProbeMatrix: (jobId: string) =>
+    post<ProbeMatrixJob>(
+      `/api/accounts/probe-matrix/${encodeURIComponent(jobId)}/cancel`),
   refresh: (file: string, upstreamId?: number | null) =>
     post<{ok: boolean; message: string}>(
       `/api/accounts/${encodeURIComponent(file)}/refresh${groupQs(upstreamId)}`),
@@ -452,7 +468,7 @@ export const upstreamsApi = {
 
 export const keyApi = {
   list: () => get<ApiKey[]>('/api/keys'),
-  create: (body: Partial<ApiKey>) => post<ApiKey>('/api/keys', body),
+  create: (body: ApiKeyCreate) => post<ApiKey>('/api/keys', body),
   update: (id: number, body: Partial<ApiKey>) => patch<ApiKey>(`/api/keys/${id}`, body),
   remove: (id: number) => del<{ok: boolean}>(`/api/keys/${id}`),
   resetUsage: (id: number) => post<{ok: boolean}>(`/api/keys/${id}/reset-usage`),

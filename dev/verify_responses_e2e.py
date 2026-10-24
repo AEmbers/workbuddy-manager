@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -169,7 +169,9 @@ def parse_events(raw: str) -> tuple[str, list[dict], dict | None]:
 
 
 def main() -> int:
-    upstream = HTTPServer(('127.0.0.1', UPSTREAM_PORT), Upstream)
+    # Each streaming assertion leaves a keep-alive connection behind. Use a
+    # threaded server so later model-catalog calls cannot block behind it.
+    upstream = ThreadingHTTPServer(('127.0.0.1', UPSTREAM_PORT), Upstream)
     threading.Thread(target=upstream.serve_forever, daemon=True).start()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -213,6 +215,22 @@ def main() -> int:
         assert r.status_code == 200, f'建密钥失败 {r.status_code}: {r.text[:300]}'
         token = r.json()['key']
         auth = {'Authorization': f'Bearer {token}'}
+
+        # ── 0. 自定义密钥也走真实 HTTP 鉴权（issue LOCAL-CUSTOM-KEY）──
+        custom_token = 'sk-e2e-custom-token-2.8.5'
+        r = client.post('/api/keys', cookies=cookies, json={
+            'name': 'e2e-custom',
+            'realm': '',
+            'key_mode': 'custom',
+            'custom_key': custom_token,
+        })
+        assert r.status_code == 200, f'自定义密钥创建失败 {r.status_code}: {r.text[:300]}'
+        assert r.json()['key'] == custom_token
+        custom_auth = {'Authorization': f'Bearer {custom_token}'}
+        r = client.post('/v1/responses', headers=custom_auth,
+                        json={'model': 'glm-5.2', 'input': 'custom key smoke'})
+        assert r.status_code == 200, f'自定义密钥鉴权失败：{r.status_code} {r.text[:300]}'
+        print('[自定义密钥] ✓ 非 wbk_ 密钥可创建并经真实 Bearer 鉴权调用')
 
         # ── 1. 非流式 ──
         r = client.post('/v1/responses', headers=auth,
@@ -300,6 +318,57 @@ def main() -> int:
         params = ((sent_tools[0].get('function') or {}).get('parameters') or {}) if sent_tools else {}
         assert params.get('required') == ['input'],             f'出站没把自定义工具包成 {{input: string}}：{sent_tools[:1]}'
         print('[自定义工具] ✓ 出站包成 {input: string}，回程还原为 custom_tool_call')
+
+        # ── 2e. 工具返图 + 用户附图经过真实 HTTP 转换（issue #134）──
+        # 1x1 PNG. The fake upstream only checks the outbound Chat payload; this
+        # exercises the real socket path, Responses conversion, ordering and
+        # image lift without spending a real upstream request.
+        image = (
+            'data:image/png;base64,'
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z0S8AAAAASUVORK5CYII='
+        )
+        with _SEEN_LOCK:
+            _SEEN.clear()
+        r = client.post('/v1/responses', headers=auth, json={
+            'model': 'glm-5.2',
+            'tools': [{
+                'type': 'function',
+                'name': 'view_image',
+                'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}}},
+            }],
+            'input': [
+                {
+                    'type': 'function_call',
+                    'call_id': 'call_image',
+                    'name': 'view_image',
+                    'arguments': '{"path":"fixture.png"}',
+                },
+                {
+                    'type': 'function_call_output',
+                    'call_id': 'call_image',
+                    'output': [
+                        {'type': 'input_text', 'text': 'tool image'},
+                        {'type': 'input_image', 'image_url': image},
+                    ],
+                },
+                {
+                    'type': 'message',
+                    'role': 'user',
+                    'content': [
+                        {'type': 'input_text', 'text': 'inspect both images'},
+                        {'type': 'input_image', 'image_url': image},
+                    ],
+                },
+            ],
+        })
+        assert r.status_code == 200, f'工具返图/用户附图请求失败：{r.status_code} {r.text[:300]}'
+        with _SEEN_LOCK:
+            sent = list(_SEEN)[-1]
+        roles = [m.get('role') for m in sent.get('messages', [])]
+        assert roles[:3] == ['assistant', 'tool', 'user'], f'工具/图片消息顺序错误：{roles}'
+        flattened = json.dumps(sent, ensure_ascii=False)
+        assert flattened.count('data:image/png;base64,') >= 2, '工具返图或用户附图被静默丢弃'
+        print('[工具图片] ✓ 真实 HTTP 下保持 assistant→tool→user 顺序，两张输入图均到达上游')
 
         # ── 2e. /v1/models 按白名单裁剪，且**列表里每个 id 都能调用**（issue #46）──
         # 这是用户报的现象：列表给出了白名单外的模型，选中就 400。

@@ -243,12 +243,15 @@ class CallSitesMapBeforeAuthorizeTest(unittest.TestCase):
 
     SITES = ('server/routers/gateway.py', 'server/routers/responses.py',
              'server/routers/anthropic.py')
+    # 调用参数可以合法地换行；扫描器必须与 Python 语法一致，不能只认
+    # `_authorize(request,` 这一种排版。两条守卫共用它，避免扫描面漂移。
+    AUTHORIZE_CALL_RE = re.compile(r'_authorize\(\s*request,[^)]*\)')
 
     def test_every_model_call_passes_mapped(self) -> None:
         offenders: list[str] = []
         for rel in self.SITES:
             src = (ROOT / rel).read_text(encoding='utf-8')
-            for m in re.finditer(r'_authorize\(request,[^)]*\)', src):
+            for m in self.AUTHORIZE_CALL_RE.finditer(src):
                 call = m.group(0)
                 if 'is_model_list=True' in call:
                     continue          # 模型发现类请求：没有 model
@@ -263,8 +266,8 @@ class CallSitesMapBeforeAuthorizeTest(unittest.TestCase):
         total = 0
         for rel in self.SITES:
             src = (ROOT / rel).read_text(encoding='utf-8')
-            total += len(re.findall(r'_authorize\(request,', src))
-        self.assertGreaterEqual(total, 4, '没扫到调用点，守卫会空转')
+            total += len(self.AUTHORIZE_CALL_RE.findall(src))
+        self.assertEqual(total, 5, '授权调用点数量变了，必须重新核对扫描面')
 
 
 if __name__ == '__main__':

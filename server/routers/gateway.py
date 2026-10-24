@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections.abc import Mapping
 from urllib.parse import urlsplit
 import logging
 import threading
@@ -422,7 +423,123 @@ def _usage_cache(usage: dict | None) -> tuple[int | None, int | None, int | None
             _one('prompt_cache_write_tokens'))
 
 
-def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt: int, ct: int, latency: int, ua: str | None, error: str | None, stream: bool, *, credit: float | None = None, first_token: int | None = None, usage: dict | None = None) -> None:
+def _header(headers: object, name: str) -> str:
+    """大小写不敏感地取一个请求头；只用于派生渠道枚举，不落原始值。"""
+    if not isinstance(headers, Mapping) and not hasattr(headers, 'items'):
+        return ''
+    wanted = name.lower()
+    try:
+        value = headers.get(name)  # type: ignore[union-attr]
+        if value is not None:
+            return str(value)
+        for key, candidate in headers.items():  # type: ignore[union-attr]
+            if str(key).lower() == wanted and candidate is not None:
+                return str(candidate)
+    except (AttributeError, TypeError, ValueError):
+        return ''
+    return ''
+
+
+def _channel_from_text(*values: object) -> str:
+    text = ' '.join(str(v or '') for v in values).lower()
+    if 'workbuddy' in text or 'work buddy' in text:
+        return 'workbuddy'
+    if any(marker in text for marker in (
+        'vscode', 'visual studio code', 'vscode-extension', 'jetbrains',
+        'intellij', 'pycharm', 'webstorm', 'goland', 'rubymine', 'clion',
+        'cursor', 'windsurf', 'zed',
+    )):
+        return 'vscode'
+    if any(marker in text for marker in (
+        'codex', 'claude-code', 'claude code', 'anthropic-cli', 'openai-cli',
+        'aider', 'cline', 'gemini-cli', 'qwen-code', 'opencode', 'curl',
+        'wget', 'httpie', 'python-requests', 'httpx', 'openai-python',
+        'anthropic-python', 'go-http-client', 'node-fetch',
+    )):
+        return 'cli'
+    return 'unknown'
+
+
+def _client_channel(headers: object, ua: str | None = None) -> str:
+    """从显式客户端标识、UA 与插件头派生渠道；不保存任何原始头。
+
+    `x-client-channel` 只是**自报**信息，不能用于鉴权或路由，仅作为日志分类线索。
+    其余标识也只变成四类枚举：cli / vscode / workbuddy / unknown。
+    """
+    explicit = _header(headers, 'x-client-channel').strip().lower()
+    explicit_map = {'cli': 'cli', 'vscode': 'vscode', 'wb': 'workbuddy',
+                    'workbuddy': 'workbuddy'}
+    if explicit in explicit_map:
+        return explicit_map[explicit]
+    header_names = ''
+    try:
+        if hasattr(headers, 'keys'):
+            header_names = ' '.join(str(k) for k in headers.keys())  # type: ignore[union-attr]
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return _channel_from_text(
+        ua or _header(headers, 'user-agent'),
+        _header(headers, 'x-client-name'),
+        _header(headers, 'x-app-name'),
+        _header(headers, 'x-ide-name'),
+        _header(headers, 'x-ide-type'),
+        header_names,
+    )
+
+
+def _reasoning_effort(body: object) -> str | None:
+    """读取客户端实际传入的推理档位，不按模型能力或默认值补猜。"""
+    if not isinstance(body, dict):
+        return None
+    raw = body.get('reasoning_effort')
+    if not isinstance(raw, str):
+        reasoning = body.get('reasoning')
+        raw = reasoning.get('effort') if isinstance(reasoning, dict) else None
+    if not isinstance(raw, str):
+        return None
+    value = db._clean(raw, 32).strip()
+    return value or None
+
+
+def _channel_validation(status: int, error: str | None) -> str:
+    """把渠道校验结果压成稳定短码，避免把上游原文/响应头写进新字段。"""
+    text = db._clean(error, 500).lower()
+    if any(marker in text for marker in (
+        'channel verification', 'official client', '渠道校验', '渠道验证',
+        '11140', '11-128', '11_128',
+    )):
+        code = '11-128' if '11-128' in text else ('11140' if '11140' in text else 'channel')
+        return f'mismatch:{code}'
+    if status == 429:
+        return 'rate_limited'
+    if 200 <= status < 400:
+        # 只是上游接受了请求；成功响应不证明它执行过显式渠道校验。
+        return 'accepted'
+    if status >= 400:
+        return 'failed'
+    return 'unknown'
+
+
+def _record(
+    key: dict | None,
+    ip: str,
+    model: str,
+    mapped: str,
+    status: int,
+    pt: int,
+    ct: int,
+    latency: int,
+    ua: str | None,
+    error: str | None,
+    stream: bool,
+    *,
+    credit: float | None = None,
+    first_token: int | None = None,
+    usage: dict | None = None,
+    reasoning_effort: str | None = None,
+    client_channel: str | None = None,
+    channel_validation: str | None = None,
+) -> None:
     """记录调用日志与用量。
 
     credit 为上游返回的真实扣费（usage.credit）。None 表示上游没给，
@@ -443,6 +560,13 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
     if credit is None:
         credit = _usage_credit(usage)
     cache_hit, cache_miss, cache_write = _usage_cache(usage)
+    effort_clean = db._clean(reasoning_effort, 32).strip() if reasoning_effort else None
+    channel_clean = (client_channel or _channel_from_text(ua)).strip().lower()
+    if channel_clean not in ('cli', 'vscode', 'workbuddy', 'unknown'):
+        channel_clean = 'unknown'
+    validation_clean = db._clean(
+        channel_validation or _channel_validation(status, error), 64,
+    ).strip()
 
     try:
         # realm 由**实际发往上游的模型名**判定（上游按 `cn:` / `global:` 前缀路由）：
@@ -481,6 +605,9 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
             cache_hit_tokens=cache_hit,
             cache_miss_tokens=cache_miss,
             cache_write_tokens=cache_write,
+            reasoning_effort=effort_clean,
+            client_channel=channel_clean,
+            channel_validation=validation_clean,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning('写入请求日志失败（不影响请求）: %s', exc)
@@ -500,7 +627,9 @@ def _record(key: dict | None, ip: str, model: str, mapped: str, status: int, pt:
 
 def _authorize(request: Request, model: str | None,
                *, is_model_list: bool = False,
-               mapped: str | None = None) -> tuple[dict | None, str, JSONResponse | None]:
+               mapped: str | None = None,
+               reasoning_effort: str | None = None
+               ) -> tuple[dict | None, str, JSONResponse | None]:
     """返回 (key, ip, error_response)。
 
     mapped：`model` 经「模型映射」后的名字。**默认在这里算**，因为版本归属判的
@@ -510,6 +639,7 @@ def _authorize(request: Request, model: str | None,
     """
     ip = iputil.client_ip(request)
     ua = request.headers.get('user-agent')
+    channel = _client_channel(request.headers, ua)
     path = request.url.path
 
     # 拦截原因写成**稳定的短码**而不是散文：界面按码翻译（5 种语言都能准确
@@ -540,7 +670,9 @@ def _authorize(request: Request, model: str | None,
         ]
         if not iputil.evaluate(ip, rules, sec.get('mode', 'blacklist')):
             _log_ip(ip, path, True, ua, 'ip_blocked')
-            _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua, 'IP 被拦截', False)
+            _record(key, ip, model or '', mapped or '', 403, 0, 0, 0, ua,
+                    'IP 被拦截', False, reasoning_effort=reasoning_effort,
+                    client_channel=channel)
             return None, ip, _oai_error(f'来源 IP {ip} 被安全策略拦截', 403, 'permission_error', 'ip_blocked')
 
     # 注意这一行**在密钥校验之前**：密钥层面的拒绝（停用 / 过期 / 配额用尽 /
@@ -554,7 +686,8 @@ def _authorize(request: Request, model: str | None,
         # 把 401/403 统一显示成「API 密钥无效」，一律 403 会把「密钥版本不匹配」
         # 这种配置问题说成密钥坏了，用户便反复重建密钥（issue #18）。
         _record(key, ip, model or '', mapped or '',
-                getattr(reason, 'status', 403), 0, 0, 0, ua, reason, False)
+                getattr(reason, 'status', 403), 0, 0, 0, ua, reason, False,
+                reasoning_effort=reasoning_effort, client_channel=channel)
         _log_ip(ip, path, True, ua, _key_reject_code(reason, is_model_list))
         return None, ip, _oai_error(
             reason,
@@ -566,7 +699,8 @@ def _authorize(request: Request, model: str | None,
     limited, count = _rate_limited(key)
     if limited:
         msg = f'请求过于频繁（{RATE_WINDOW}s 内超过 {RATE_MAX_PER_MIN} 次）'
-        _record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False)
+        _record(key, ip, model or '', mapped or '', 429, 0, 0, 0, ua, msg, False,
+                reasoning_effort=reasoning_effort, client_channel=channel)
         _log_ip(ip, path, True, ua, 'rate_limited')
         return None, ip, _oai_error(msg, 429, 'rate_limit_error', 'rate_limit_exceeded')
 
@@ -653,7 +787,9 @@ def _upstream_hint(upstream: dict | None) -> str:
 
 
 def _upstream_for(key: dict | None, *, ip: str, model: str, mapped: str,
-                  ua: str | None) -> tuple[dict | None, JSONResponse | None]:
+                  ua: str | None, reasoning_effort: str | None = None,
+                  client_channel: str | None = None
+                  ) -> tuple[dict | None, JSONResponse | None]:
     """按密钥解析本次请求该走哪个上游；不可用时返回**明确报错**。
 
     不静默回落默认上游的原因见 upstreamsvc 模块注释第 2 条：那把密钥本应只碰
@@ -663,7 +799,8 @@ def _upstream_for(key: dict | None, *, ip: str, model: str, mapped: str,
     try:
         return upstreamsvc.resolve_for_key(key), None
     except upstreamsvc.UpstreamUnavailable as exc:
-        _record(key, ip, model, mapped, 503, 0, 0, 0, ua, str(exc), False)
+        _record(key, ip, model, mapped, 503, 0, 0, 0, ua, str(exc), False,
+                reasoning_effort=reasoning_effort, client_channel=client_channel)
         # 这里不加 _upstream_hint：本函数讲的是「密钥绑定的上游不可用」，作用域里
         # 也没有那个上游对象 —— 报出默认上游的地址只会把人带偏（异常文本已经说清
         # 是哪个分组、该启用还是改绑）。
@@ -1049,7 +1186,11 @@ async def _chat(request: Request, upstream_path: str):
     # 映射**先于鉴权**：版本归属判的是实际要用的名字（issue #47），配了
     # 「别名 → 带前缀的真名」的密钥此前会被 realm 检查当成错版本打回。
     mapped = _map_model(requested_model)
-    key, ip, err = _authorize(request, requested_model, mapped=mapped)
+    effort = _reasoning_effort(body)
+    channel = _client_channel(request.headers, request.headers.get('user-agent'))
+    key, ip, err = _authorize(
+        request, requested_model, mapped=mapped, reasoning_effort=effort,
+    )
     if err:
         return err
 
@@ -1069,7 +1210,9 @@ async def _chat(request: Request, upstream_path: str):
 
     ua = request.headers.get('user-agent')
     upstream, upstream_err = _upstream_for(key, ip=ip, model=requested_model or '',
-                                           mapped=mapped or '', ua=ua)
+                                           mapped=mapped or '', ua=ua,
+                                           reasoning_effort=effort,
+                                           client_channel=channel)
     if upstream_err:
         return upstream_err
     url = f'{upstream["base_url"]}{upstream_path}'
@@ -1092,13 +1235,16 @@ async def _chat(request: Request, upstream_path: str):
             _record(
                 key, ip, requested_model or '', mapped or '', resp.status_code, pt, ct,
                 latency, ua, error, False, usage=usage,
+                reasoning_effort=effort, client_channel=channel,
             )
             if data is not None:
                 return JSONResponse(data, status_code=resp.status_code)
             return JSONResponse({'error': {'message': resp.text[:1000], 'type': 'api_error'}}, status_code=resp.status_code)
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), False)
+            _record(key, ip, requested_model or '', mapped or '', 502, 0, 0,
+                    latency, ua, str(exc), False,
+                    reasoning_effort=effort, client_channel=channel)
             return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     # 流式转发
@@ -1109,7 +1255,9 @@ async def _chat(request: Request, upstream_path: str):
     except Exception as exc:  # noqa: BLE001
         await client.aclose()
         latency = int((time.time() - started) * 1000)
-        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0, latency, ua, str(exc), True)
+        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0,
+                latency, ua, str(exc), True,
+                reasoning_effort=effort, client_channel=channel)
         return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
 
     status_code = resp.status_code
@@ -1148,7 +1296,8 @@ async def _chat(request: Request, upstream_path: str):
             _record(
                 key, ip, requested_model or '', mapped or '', status_code, pt, ct,
                 latency, ua, error_text, True, usage=usage,
-                first_token=first_token_ms,
+                first_token=first_token_ms, reasoning_effort=effort,
+                client_channel=channel,
             )
 
     return StreamingResponse(generator(), status_code=status_code, media_type=content_type)

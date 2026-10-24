@@ -60,6 +60,34 @@ powershell -ExecutionPolicy Bypass -File windows\launcher\build.ps1
 目标机器**无需安装 Python / Node / Go**，安装后即可直接启动。构建细节见
 [`launcher/build.ps1`](launcher/build.ps1) 顶部注释。
 
+### 登录 Windows 时自动启动
+
+安装向导里的「登录 Windows 时自动启动」**默认不勾选**；安装后也可以在控制窗口的
+监听配置区随时切换。状态只以当前用户的 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+下带安装目录哈希后缀的 `WorkBuddyManager.<安装标识>` 值为准；
+不同安装目录各自独立，不会互相关闭或改写。每个值都是：
+
+```text
+"<安装目录>\WorkBuddyManager.exe" --silent
+```
+
+登录自启时控制窗口只驻留托盘，不显示主窗体，也不会弹出初始管理员密码提示；同时自动
+执行与「启动项目」相同的 `prepare.ps1` 和 `service-tools.ps1 start`，因此面板服务与
+上游网关会一起启动。若已健康运行则不会重复拉起；启动失败或超时会打开主窗口显示错误。
+双击托盘图标或再次启动 `WorkBuddyManager.exe` 都会唤醒已有实例。
+
+托盘可用性会同时检查 Explorer 的 `Shell_TrayWnd` / `TrayNotifyWnd`。不能确认托盘
+可用时程序 fail closed，直接显示主窗口，避免留下无法找到的隐藏进程；这不跳过登录
+自启流程，面板服务和上游网关仍会自动拉起。
+
+覆盖安装会保留原来的自启选择，并把 Run 值更新为新安装目录；卸载会删除该 Run 值。
+同一台机器上的不同安装目录各有独立的单实例标识，可以同时运行。
+
+桌面快捷方式、「设置 → 应用」卸载项和开始菜单程序组仍使用固定名称，这是 Windows
+用户级安装入口的共享命名空间：最后安装的实例拥有这些入口。卸载任一实例只清理指向
+自己的快捷方式与卸载项，不结束其他安装目录的进程、不删除其他实例的 Run 值；如果固定
+入口指向前一个实例，它会被保留。
+
 ### 安装目录与卸载（两点要知道）
 
 **安装目录**：向导里选中的文件夹被当作**父目录**，程序装进它的 `WorkBuddyManager`

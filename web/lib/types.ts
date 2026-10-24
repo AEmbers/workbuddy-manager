@@ -146,6 +146,75 @@ export interface AccountsResponse {
   manageable?: boolean;
 }
 
+/* ── 账号 × 模型矩阵探测（issue #270）─────────────── */
+
+export type ProbeRealm = 'cn' | 'global';
+
+export type ProbeMatrixState =
+  | 'queued'
+  | 'running'
+  | 'cancelling'
+  | 'cancelled'
+  | 'failed'
+  | 'finished';
+
+export type ProbeCellStatus =
+  | 'pending'
+  | 'running'
+  | 'cancelled'
+  | 'success'
+  | 'rate_limited'
+  | 'quota_exhausted'
+  | 'unauthorized'
+  | 'model_unavailable'
+  | 'upstream_error'
+  | 'budget_exhausted'
+  | 'request_error';
+
+export interface ProbeMatrixAccount {
+  file: string;
+  nickname: string;
+  realm: ProbeRealm;
+}
+
+export interface ProbeMatrixResult {
+  account_file: string;
+  nickname: string;
+  realm: ProbeRealm;
+  model: string;
+  request_model: string;
+  status: ProbeCellStatus;
+  code: number | string | null;
+  message: string;
+  elapsed_ms: number;
+}
+
+export interface ProbeMatrixJob {
+  job_id: string;
+  state: ProbeMatrixState;
+  accounts: ProbeMatrixAccount[];
+  models: string[];
+  account_concurrency: number;
+  request_interval_ms: number;
+  /** Hard cap on physical outbound HTTP attempts, including channel fallback. */
+  request_budget: number;
+  /** Physical outbound attempts already consumed by this job. */
+  requests_used: number;
+  estimated_seconds: number;
+  progress: {
+    total: number;
+    completed: number;
+    succeeded: number;
+    failed: number;
+    pending: number;
+    running: number;
+  };
+  results: ProbeMatrixResult[];
+  created_at: number;
+  finished_at: number | null;
+  error: string | null;
+}
+
 /**
  * 令牌刷新计划（计划任务）：每 `interval_days` 天的 `hour` 整点，全量刷新一次
  * 所有账号的 accessToken。与「快过期才续期」的自动续期是并列的两条路径。
@@ -478,6 +547,15 @@ export interface ApiKey {
 }
 
 /**
+ * 新建密钥时可以额外选择随机生成，或由管理员输入一把已有密钥。
+ * 编辑接口刻意不接受这两个字段：写入后数据库只保留哈希。
+ */
+export interface ApiKeyCreate extends Partial<ApiKey> {
+  key_mode?: 'random' | 'custom';
+  custom_key?: string;
+}
+
+/**
  * 密钥导出结果（`POST /api/keys/export`）。
  *
  * 两个客户端的载荷载体不同，故用可选字段而不是联合类型：调用方按 `client`
@@ -650,6 +728,15 @@ export interface RequestLog {
   /** 本次调用的真实扣费（上游 usage.credit）；null = 上游未返回，不是 0 */
   credit: number | null;
   /**
+   * 客户端实际传入的推理档位（issue #267）。
+   * null = 客户端没有传或该记录早于本功能上线；界面显示「未指定」，不按模型默认值猜。
+   */
+  reasoning_effort: string | null;
+  /** 仅由 UA/客户端标识派生的渠道枚举；不保存原始请求头（issue #233）。 */
+  client_channel: 'cli' | 'vscode' | 'workbuddy' | 'unknown';
+  /** 渠道校验稳定短码：accepted / rate_limited / failed / mismatch:<code> / unknown。 */
+  channel_validation: string | null;
+  /**
    * 本次实际用了哪个上游账号，形如 `昵称(uid8)`。
    *
    * 账号由上游决定、不在响应里回传，本端是**采集上游容器日志后按时间对回来的**，
@@ -657,6 +744,38 @@ export interface RequestLog {
    * 稍后刷新即有）。null 也可能是「日志已滚掉」或「上游没在跑容器」。
    */
   account: string | null;
+}
+
+/** 账号日志回填采集器的实时诊断快照（issue #232）。 */
+export interface AccountCollectorStatus {
+  source: 'docker' | 'native' | string;
+  /** 完整路径或容器名；普通只读用户收到空串。 */
+  log_location: string;
+  log_readable: boolean;
+  last_attempt_at: number | null;
+  last_success_at: number | null;
+  last_parsed_count: number;
+  last_matched_count: number;
+  last_unmatched_count: number;
+  last_already_matched_count: number;
+  matched_count: number;
+  unmatched_count: number;
+  already_matched_count: number;
+  last_error: string | null;
+  poll_seconds: number;
+  running: boolean;
+}
+
+export interface AccountCollectNowResult {
+  ok: boolean;
+  result: {
+    parsed: number;
+    filled: number;
+    unmatched: number;
+    already_matched?: number;
+    log_readable: boolean;
+  };
+  status: AccountCollectorStatus;
 }
 
 export interface UsagePoint {
