@@ -85,7 +85,7 @@ class PolicyTest(unittest.TestCase):
             {PRIMARY: 'not-a-list'},
             {PRIMARY: []},
             {PRIMARY: [PRIMARY]},
-            {PRIMARY: ['a', 'b', 'c', 'd']},
+            {PRIMARY: ['a', 'b', 'c', 'd', 'e', 'f']},
             {PRIMARY: ['has space']},
             {PRIMARY: ['*']},
             {'': [FALLBACK]},
@@ -158,6 +158,35 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(modelfallback._seconds_until(message, now=now), 3600)
         message = 'reset at 2026-10-24 20:35:49 UTC+08:00'
         self.assertEqual(modelfallback._seconds_until(message, now=now), 3600)
+
+    def test_default_chain_applies_to_any_primary(self) -> None:
+        # '*' 默认链：任何未单独配置链的模型在额度耗尽后都走它（调谁谁用完就进链）。
+        table = {'*': ['fallback-a', 'fallback-b']}
+        key = _key(realm='cn', models=['kimi-k3', 'fallback-a', 'fallback-b'])
+        plan = modelfallback.build_plan('kimi-k3', 'kimi-k3', table=table, key=key)
+        self.assertEqual(plan, ['kimi-k3', 'fallback-a', 'fallback-b'])
+
+    def test_default_chain_skips_called_model_itself(self) -> None:
+        # 默认链里含被调用模型自身时剔除（选 DeepSeek 用完 → 从链内下一站走）。
+        table = {'*': [PRIMARY, FALLBACK]}
+        key = _key(realm='cn', models=[PRIMARY, FALLBACK])
+        plan = modelfallback.build_plan(PRIMARY, PRIMARY, table=table, key=key)
+        self.assertEqual(plan, [PRIMARY, FALLBACK])
+
+    def test_explicit_chain_overrides_default(self) -> None:
+        table = {PRIMARY: [FALLBACK], '*': ['other']}
+        key = _key(realm='cn', models=[PRIMARY, FALLBACK])
+        plan = modelfallback.build_plan(PRIMARY, PRIMARY, table=table, key=key)
+        self.assertEqual(plan, [PRIMARY, FALLBACK])
+
+    def test_validate_accepts_default_chain_key(self) -> None:
+        self.assertEqual(
+            modelfallback.validate({'*': [FALLBACK]}),
+            {'*': [FALLBACK]},
+        )
+        # '*' 不能作为链内候选（仍然只允许可见 ASCII 具体模型名）。
+        with self.assertRaises(ValueError):
+            modelfallback.validate({PRIMARY: ['*']})
 
     def test_chain_obeys_realm_and_whitelist(self) -> None:
         table = {PRIMARY: ['global:wrong-realm', 'blocked', 'allowed']}

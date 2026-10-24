@@ -16,8 +16,8 @@ import re
 import threading
 import time
 
-MAX_FALLBACKS = 3
-MAX_ATTEMPTS = 4
+MAX_FALLBACKS = 5
+MAX_ATTEMPTS = 6
 MAX_MODEL_LENGTH = 128
 DEFAULT_EXHAUSTED_COOLDOWN = 120
 MAX_LOCAL_EXHAUSTED_COOLDOWN = 900
@@ -72,13 +72,24 @@ def _model_name(raw: object, *, label: str = '模型名') -> str:
     return name
 
 
+DEFAULT_CHAIN_KEY = '*'
+
+
 def validate(raw: object) -> dict[str, list[str]]:
-    """Validate and normalize a ``{primary: [fallback, ...]}`` setting."""
+    """Validate and normalize a ``{primary: [fallback, ...]}`` setting.
+
+    主模型键可以是 ``'*'``（默认降级链）：任何没有单独配置链的主模型在额度
+    耗尽后都走它——"调用哪个模型就用哪个，用完进默认链"。默认链里的候选若
+    与实际调用的主模型相同，会在 chain_for 里按"不降级到自身"剔除。
+    """
     if not isinstance(raw, dict):
         raise ValueError('模型降级链必须是一个对象')
     clean: dict[str, list[str]] = {}
     for raw_primary, raw_fallbacks in raw.items():
-        primary = _model_name(raw_primary, label='主模型名')
+        if raw_primary == DEFAULT_CHAIN_KEY:
+            primary = DEFAULT_CHAIN_KEY
+        else:
+            primary = _model_name(raw_primary, label='主模型名')
         if not isinstance(raw_fallbacks, list):
             raise ValueError(f'模型 {primary} 的降级链必须是数组')
         if not raw_fallbacks:
@@ -144,6 +155,12 @@ def chain_for(
     fallbacks = config.get(effective)
     if fallbacks is None and primary and primary != effective:
         fallbacks = config.get(primary)
+    if fallbacks is None:
+        # 默认降级链（'*'）：调用任何未单独配置链的模型，其额度耗尽后都走它。
+        # 链内与实际调用模型相同的候选由 seen_actual 剔除（不降级到自身），
+        # 因此 "选 Kimi 用完 → DeepSeek 起" 与 "选 DeepSeek 用完 → MiniMax 起"
+        # 由同一条默认链自然表达。
+        fallbacks = config.get(DEFAULT_CHAIN_KEY)
     if not fallbacks:
         return []
 
