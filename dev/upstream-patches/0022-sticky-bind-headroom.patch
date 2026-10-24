@@ -1,0 +1,456 @@
+diff --git a/cmd/server/main.go b/cmd/server/main.go
+index de1599c..59bd466 100644
+--- a/cmd/server/main.go
++++ b/cmd/server/main.go
+@@ -119,6 +119,9 @@ func main() {
+ 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏，
+ 			// 见 wiring.go）；裸名走 cn（现状零回归）。
+ 			AvailableForModel: realmAwareAvailableForModel(p),
++			// 首绑画像闭包：水位均衡 + 质量决胜（余量 = 容量 − 已绑会话数，
++			// 同层按质量加权决胜）。realm 感知口径与 AvailableForModel 同源。
++			Profiles: realmAwareBindProfiles(p),
+ 		})
+ 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
+ 		sessRouter.StartGC()
+diff --git a/cmd/server/wiring.go b/cmd/server/wiring.go
+index a5efefb..c64e43e 100644
+--- a/cmd/server/wiring.go
++++ b/cmd/server/wiring.go
+@@ -3,6 +3,7 @@ package main
+ import (
+ 	"workbuddy2api/internal/pool"
+ 	"workbuddy2api/internal/server"
++	"workbuddy2api/internal/session"
+ )
+ 
+ // realmAwareAvailableForModel 构造会话粘性路由按模型可用口径的 realm 感知闭包。
+@@ -18,4 +19,19 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
+ 		realm, bare := server.ResolveModel(model)
+ 		return p.AvailableUIDsForModelRealm(bare, realm)
+ 	}
++}
++
++// realmAwareBindProfiles 构造会话粘性首绑的画像闭包（realm 感知，口径与上面同一套
++// ResolveModel 剥前缀规则）。pool.BindProfile 与 session.BindProfile 字段一致，
++// 直接结构转换，pool ↔ session 保持互不依赖。
++func realmAwareBindProfiles(p *pool.Pool) func(model string) []session.BindProfile {
++	return func(model string) []session.BindProfile {
++		realm, bare := server.ResolveModel(model)
++		profiles := p.BindProfilesForModelRealm(bare, realm)
++		out := make([]session.BindProfile, len(profiles))
++		for i, pr := range profiles {
++			out[i] = session.BindProfile{UID: pr.UID, Capacity: pr.Capacity, Quality: pr.Quality}
++		}
++		return out
++	}
+ }
+\ No newline at end of file
+diff --git a/internal/pool/bindprofile.go b/internal/pool/bindprofile.go
+new file mode 100644
+index 0000000..cfb2401
+--- /dev/null
++++ b/internal/pool/bindprofile.go
+@@ -0,0 +1,66 @@
++// 会话粘性首绑画像（internal/session 的 Config.Profiles 数据源）。
++// 与 AvailableUIDsForModelRealm 的候选口径完全一致（realm 过滤 + healthy[ForModel]
++// + 在途占满过滤），额外暴露两个粘性首绑需要的维度：
++//   - Capacity 承载容量：在途上限口径（并发额度是上游对单号最硬的约束，
++//     用它当会话容量，负载才能摊到与各号真实额度成比例）；
++//   - Quality 质量分：weightOf 三因子（credits 比例 + 快过期占比 + 闲置补偿）×
++//     手写权重，与 pick 的短名单权重同源同口径（全集 maxCredits 基准）。
++package pool
++
++import (
++	"sort"
++	"time"
++)
++
++// BindProfile 单账号的粘性首绑画像。
++type BindProfile struct {
++	UID      string
++	Capacity float64
++	Quality  float64
++}
++
++// sessionNominalCapacity 在途不设上限（inFlightLimit<=0）时的名义会话容量。
++// 上限无限时各号容量本就不可比，给同一名义值即可：水位由「已绑会话数」主导，
++// 质量分在并列层内决胜——这正是无限额池子的正确语义。
++const sessionNominalCapacity = 8.0
++
++// BindProfilesForModelRealm 返回该 (model, realm) 域内可绑定账号的首绑画像，
++// 按 UID 排序（稳定输出，便于上层确定性测试）。model 为空时健康口径退化为
++// 账号级 healthy（与 AvailableUIDsForRealm 一致）。
++func (p *Pool) BindProfilesForModelRealm(model, realm string) []BindProfile {
++	p.mu.RLock()
++	defer p.mu.RUnlock()
++	now := time.Now()
++	health := func(e *entry) bool { return e.healthy(now) }
++	if model != "" {
++		health = func(e *entry) bool { return e.healthyForModel(now, model) }
++	}
++	var cands []*entry
++	var maxCredits int64
++	for _, e := range p.byUID {
++		if realm != "" && e.a.Realm() != realm {
++			continue
++		}
++		if !health(e) || p.inFlightFull(e) {
++			continue
++		}
++		cands = append(cands, e)
++		if e.credits > maxCredits {
++			maxCredits = e.credits
++		}
++	}
++	out := make([]BindProfile, 0, len(cands))
++	for _, e := range cands {
++		capacity := float64(p.inFlightLimit(e))
++		if capacity <= 0 {
++			capacity = sessionNominalCapacity
++		}
++		out = append(out, BindProfile{
++			UID:      e.a.UID,
++			Capacity: capacity,
++			Quality:  p.weightOf(e, maxCredits, now),
++		})
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].UID < out[j].UID })
++	return out
++}
+diff --git a/internal/session/bind_headroom_test.go b/internal/session/bind_headroom_test.go
+new file mode 100644
+index 0000000..0986209
+--- /dev/null
++++ b/internal/session/bind_headroom_test.go
+@@ -0,0 +1,132 @@
++package session
++
++import (
++	"testing"
++	"time"
++)
++
++// profilesOf 构造画像闭包（UID 顺序即决胜层顺序；池侧输出按 UID 升序，同口径）。
++func profilesOf(ps ...BindProfile) func(string) []BindProfile {
++	return func(string) []BindProfile { return ps }
++}
++
++// randFirst 恒选层内第一个候选（确定性）：加权抽签 r=0 → 累计第一个区间命中。
++func randFirst(int64) int64 { return 0 }
++
++// TestHeadroomSpreadsByCapacity：高质量号不能超容量承接，余量满了必须让位。
++// 推演（容量均 3、rand 恒取层内首个）：c1→a1(层=全体)、c2→a1(h 2≥best3−1)、
++// c3→a2(a1 h=1 出层)、c4→a1(h 2)、c5→a2(a1 h=0 出层)、c6→a3。
++// 期望 a1=3(=容量，不超载)、a2=2、a3=1——质量优先但被容量封顶。
++func TestHeadroomSpreadsByCapacity(t *testing.T) {
++	r := New(Config{
++		TTL:      time.Minute,
++		Store:    newCountingStore(),
++		Available: func() []string { return []string{"a1", "a2", "a3"} },
++		Profiles: profilesOf(
++			BindProfile{UID: "a1", Capacity: 3, Quality: 1e9}, // 质量碾压
++			BindProfile{UID: "a2", Capacity: 3, Quality: 1},
++			BindProfile{UID: "a3", Capacity: 3, Quality: 1},
++		),
++		RandInt64N: randFirst,
++	})
++	counts := map[string]int{}
++	for _, key := range []string{"c1", "c2", "c3", "c4", "c5", "c6"} {
++		uid, ok := r.ResolveForModel(key, "m")
++		if !ok {
++			t.Fatalf("resolve %s failed", key)
++		}
++		counts[uid]++
++	}
++	want := map[string]int{"a1": 3, "a2": 2, "a3": 1}
++	for uid, n := range want {
++		if counts[uid] != n {
++			t.Fatalf("account %s bound %d, want %d (all: %v)", uid, counts[uid], n, counts)
++		}
++	}
++}
++
++// TestHeadroomQualityDecidesTiedTier：容量并列（同水位层）时质量分决胜。
++func TestHeadroomQualityDecidesTiedTier(t *testing.T) {
++	r := New(Config{
++		TTL:      time.Minute,
++		Store:    newCountingStore(),
++		Available: func() []string { return []string{"a1", "a2"} },
++		Profiles: profilesOf(
++			BindProfile{UID: "a1", Capacity: 8, Quality: 1e9},
++			BindProfile{UID: "a2", Capacity: 8, Quality: 1},
++		),
++		RandInt64N: randFirst,
++	})
++	uid, ok := r.ResolveForModel("c1", "m")
++	if !ok || uid != "a1" {
++		t.Fatalf("quality should win tied tier: uid=%s ok=%v", uid, ok)
++	}
++}
++
++// TestHeadroomToleranceExcludesOverloaded：余量落后超过 1 个槽位的高分号必须出局
++// ——质量不允许牺牲一个会话槽位。
++func TestHeadroomToleranceExcludesOverloaded(t *testing.T) {
++	r := New(Config{
++		TTL:      time.Minute,
++		Store:    newCountingStore(),
++		Available: func() []string { return []string{"a1", "a2"} },
++		Profiles: profilesOf(
++			BindProfile{UID: "a1", Capacity: 8, Quality: 1e9},
++			BindProfile{UID: "a2", Capacity: 8, Quality: 1},
++		),
++		RandInt64N: randFirst,
++	})
++	// a1 预绑 3 个会话（余量 5），a2 空闲（余量 8）：差距 3 > 容差 1 → a1 出层。
++	r.Bind("k1", "a1")
++	r.Bind("k2", "a1")
++	r.Bind("k3", "a1")
++	uid, ok := r.ResolveForModel("c-new", "m")
++	if !ok || uid != "a2" {
++		t.Fatalf("overloaded high-quality account must lose: uid=%s ok=%v", uid, ok)
++	}
++}
++
++// TestProfilesNilFallsBackToHash：未注入画像时回落双段哈希——结果与 hashIndex
++// 逐位一致、同键稳定（老配置零回归）。
++func TestProfilesNilFallsBackToHash(t *testing.T) {
++	r := New(Config{
++		TTL:       time.Minute,
++		Store:     newCountingStore(),
++		Available: func() []string { return []string{"a1", "a2", "a3"} },
++	})
++	uids := []string{"a1", "a2", "a3"} // 全空闲 → 空闲段 = 全池，直接哈希取模
++	u1, ok := r.ResolveForModel("c1", "m")
++	if !ok {
++		t.Fatal("resolve failed")
++	}
++	if want := uids[hashIndex("c1", len(uids))]; u1 != want {
++		t.Fatalf("fallback should equal legacy hash: got %s want %s", u1, want)
++	}
++	if u2, _ := r.ResolveForModel("c1", "m"); u2 != u1 {
++		t.Fatalf("same key should stay bound: %s vs %s", u1, u2)
++	}
++}
++
++// TestHeadroomCountsOnlyActiveBindings：TTL 已过期、尚未被 GC 的绑定不占水位
++// ——旧会话不该永远压低该号余量。
++func TestHeadroomCountsOnlyActiveBindings(t *testing.T) {
++	r := New(Config{
++		TTL:      10 * time.Millisecond,
++		Store:    newCountingStore(),
++		Available: func() []string { return []string{"a1", "a2"} },
++		Profiles: profilesOf(
++			BindProfile{UID: "a1", Capacity: 2, Quality: 1e9},
++			BindProfile{UID: "a2", Capacity: 2, Quality: 1},
++		),
++	})
++	r.Bind("old-1", "a1")
++	r.Bind("old-2", "a1")
++	time.Sleep(25 * time.Millisecond) // 让绑定 TTL 过期（GC 尚未跑）
++	uid, ok := r.ResolveForModel("fresh", "m")
++	if !ok {
++		t.Fatal("resolve failed")
++	}
++	if uid != "a1" {
++		t.Fatalf("expired bindings should not hold capacity: got %s", uid)
++	}
++}
+diff --git a/internal/session/session.go b/internal/session/session.go
+index 2e238fb..868f7cf 100644
+--- a/internal/session/session.go
++++ b/internal/session/session.go
+@@ -4,7 +4,8 @@
+ // 但改为纯内存 + redisstore 异步镜像：
+ //   - 命中走 RLock 快查（绝大多数请求已绑定）；
+ //   - 未命中/失效走写锁 re-check 后分配，避免同 key 并发重复分配（TOCTOU 防护）；
+-//   - 分配优先"空闲账号"（未绑定任何会话的可用号）哈希，其次全池哈希（双段策略）；
++//   - 首绑走「水位均衡 + 质量决胜」：余量 = Capacity − 已绑会话数，优先余量最大者，
++//     同层按 Quality 加权随机决胜（Config.Profiles 注入）；未注入时回落双段哈希；
+ //   - LastActive 滚动续期，TTL 过期由后台 GC 或快路径惰性过期清理；
+ //   - 每次绑定变更 fire-and-forget 镜像到 redisstore（防重启丢粘性）。
+ package session
+@@ -14,6 +15,8 @@ import (
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"log"
++	"math"
++	"math/rand/v2"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -27,6 +30,15 @@ type entry struct {
+ 	lastActive time.Time
+ }
+ 
++// BindProfile 首绑画像（由 pool 侧经 Config.Profiles 注入，本包不直接依赖 pool）：
++// Capacity 为该号的会话承载容量（在途上限口径），Quality 为质量分
++// （credits 比例 + 快过期占比 + 闲置补偿 × 手写权重，与 pick 短名单权重同源）。
++type BindProfile struct {
++	UID      string
++	Capacity float64
++	Quality  float64
++}
++
+ // Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表，
+ // 由 pool.AvailableUIDs 提供。Store 可为 redisstore.Noop（纯内存）。
+ type Config struct {
+@@ -39,9 +51,19 @@ type Config struct {
+ 	// （无模型维度，行为与引入前一致）。
+ 	//
+ 	// 为什么粘性需要模型维度：绑定只记 uid，而同一个会话可能换模型。账号被 6004
+-	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
+-	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
++	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级
++	// 可用性校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
+ 	AvailableForModel func(model string) []string
++	// Profiles 按请求模型返回可绑定账号的首绑画像（候选口径与 AvailableForModel
++	// 一致）。nil 时首绑回落旧的 hashIndex 双段哈希（行为与引入前一致）。
++	//
++	// 为什么首绑不该只看质量：会话一旦绑定就整段 TTL 钉在号上，纯质量加权抽签
++	// 会让新会话持续向高分号（通常是积分最多的号）扎堆——高分号承载的会话数远超
++	// 其并发配额比例，6004 与在途占满都先打在它身上。首绑的合理目标是
++	// **把会话摊到与各号承载容量成比例**，质量只在摊平之后做同层决胜。
++	Profiles func(model string) []BindProfile
++	// RandInt64N 测试注入的确定性随机源（语义同 pool 的同名注入）；nil 用全局源。
++	RandInt64N func(n int64) int64
+ }
+ 
+ // Router 会话粘性路由器。
+@@ -173,22 +195,26 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
+ 		return "", false
+ 	}
+ 
+-	// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
+-	bound := map[string]bool{}
+-	for _, v := range r.entries {
+-		bound[v.uid] = true
+-	}
+-	var idle []string
+-	for _, u := range uids {
+-		if !bound[u] {
+-			idle = append(idle, u)
++	uid := r.pickFirstBind(key, model, uids)
++	if uid == "" {
++		// 回落（Profiles 未注入/为空）：旧的双段哈希——优先"空闲账号"
++		// （未被任何会话绑定的可用号），其次全池，段内按键 FNV 哈希取模。
++		bound := map[string]bool{}
++		for _, v := range r.entries {
++			bound[v.uid] = true
+ 		}
++		var idle []string
++		for _, u := range uids {
++			if !bound[u] {
++				idle = append(idle, u)
++			}
++		}
++		pool2 := idle
++		if len(pool2) == 0 {
++			pool2 = uids
++		}
++		uid = pool2[hashIndex(key, len(pool2))]
+ 	}
+-	pool2 := idle
+-	if len(pool2) == 0 {
+-		pool2 = uids
+-	}
+-	uid := pool2[hashIndex(key, len(pool2))]
+ 
+ 	prev, existed := r.entries[key]
+ 	r.entries[key] = entry{uid: uid, lastActive: now}
+@@ -199,6 +225,96 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
+ 	return uid, true
+ }
+ 
++// headroomTolerance 首绑水位层的容差：余量在「最高余量 − 1」以内的账号都进决胜层。
++// 1 = 一个会话槽位——质量分只在「不牺牲一个槽位」的前提下参与决策，摊平优先。
++const headroomTolerance = 1.0
++
++// pickFirstBind 为新会话选首绑账号（调用方已持写锁；r.entries 只读遍历）。
++//
++// 水位均衡 + 质量决胜（自研策略，替代旧的 hashIndex 双段哈希）：
++//
++//	余量 = Capacity（承载容量，在途上限口径）− 该号当前活跃绑定数
++//
++// 先取余量最大的账号层（容差 headroomTolerance），层内按 Quality 加权随机决胜。
++// 与旧的「先空闲段后全池段、段内按键哈希取模」相比：
++//   - 哈希取模的结果只由会话键决定，与账号状态完全无关——高积分号未必被用上，
++//     低积分号也可能被钉上一堆会话；水位策略把负载摊到与容量成比例；
++//   - 旧的"空闲段优先"是水位策略的特例（未绑定号余量天然最大），不再单独分段；
++//   - 质量分（credits/快过期/闲置/手写权重）没有丢：它决定同水位层内谁先承接。
++//
++// Profiles 未注入或返回空（老配置/测试）时返回 ""，调用方回落 hashIndex 路径。
++func (r *Router) pickFirstBind(key, model string, uids []string) string {
++	if r.cfg.Profiles == nil {
++		return "" // 未注入画像（老配置/测试）：调用方回落 hashIndex 双段哈希
++	}
++	profiles := r.cfg.Profiles(model)
++	if len(profiles) == 0 {
++		return ""
++	}
++	avail := make(map[string]bool, len(uids))
++	for _, u := range uids {
++		avail[u] = true
++	}
++	now := time.Now()
++	load := make(map[string]int, len(profiles))
++	for _, e := range r.entries {
++		if expired(e, now, r.cfg.TTL) {
++			continue // 只统计活跃绑定；过期未 GC 的条目不占水位
++		}
++		load[e.uid]++
++	}
++	var cands []BindProfile
++	best := math.Inf(-1)
++	for _, pr := range profiles {
++		if !avail[pr.UID] {
++			continue // 与可用口径双保险（Profiles 与 AvailableForModel 同源，正常恒过）
++		}
++		cands = append(cands, pr)
++		if h := pr.Capacity - float64(load[pr.UID]); h > best {
++			best = h
++		}
++	}
++	if len(cands) == 0 {
++		return ""
++	}
++	tier := make([]BindProfile, 0, len(cands))
++	for _, c := range cands {
++		if h := c.Capacity - float64(load[c.UID]); h >= best-headroomTolerance {
++			tier = append(tier, c)
++		}
++	}
++	return pickWeightedProfile(tier, r.cfg.RandInt64N)
++}
++
++// pickWeightedProfile 按 Quality 加权随机抽一个画像（定点 int64 抽签，口径同
++// pool.pickWeighted：权重下限 1 防低分号权重归零失权）。randHook 为 nil 用全局源。
++func pickWeightedProfile(cands []BindProfile, randHook func(n int64) int64) string {
++	const scale = 1_000_000
++	weights := make([]int64, len(cands))
++	var total int64
++	for i, c := range cands {
++		wi := int64(c.Quality*scale + 0.5)
++		if wi < 1 {
++			wi = 1
++		}
++		weights[i] = wi
++		total += wi
++	}
++	rnd := rand.Int64N
++	if randHook != nil {
++		rnd = randHook
++	}
++	r := rnd(total)
++	var acc int64
++	for i := range cands {
++		acc += weights[i]
++		if r < acc {
++			return cands[i].UID
++		}
++	}
++	return cands[len(cands)-1].UID
++}
++
+ // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
+ func (r *Router) touch(key, uid string, now time.Time) {
+ 	r.mu.Lock()

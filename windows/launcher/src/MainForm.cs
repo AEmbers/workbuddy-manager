@@ -135,6 +135,10 @@ namespace WorkBuddyLauncher
         private bool _suppressAutoStartEvent;
         private bool _autostartProbePending;
         private bool _autostartServicePending;
+        private UpdateBanner _updateBanner;
+        private bool _updateDismissed;
+        private bool _updateCheckRunning;
+        private int _updateTickCounter;
         private string _currentHost = EnvConfig.DefaultHost;
         private int _currentPort = EnvConfig.DefaultPort;
 
@@ -162,6 +166,12 @@ namespace WorkBuddyLauncher
             ClientSize = new Size(480, 542);
 
             BuildUi();
+            // 更新横幅先加入（Visible=false 不占位）：Dock 计算顺序里越晚加入的
+            // 越靠外沿——最终层级为 [标题横幅][更新横幅(有新版时)][内容面板]。
+            _updateBanner = new UpdateBanner(string.Empty);
+            _updateBanner.Visible = false;
+            _updateBanner.Dismissed += delegate { _updateDismissed = true; };
+            Controls.Add(_updateBanner);
             // 横幅后添加（Dock 计算顺序：横幅先停靠顶部，内容面板填充剩余）
             var banner = new BannerPanel(LauncherPaths.AppName, "项目服务控制台", 60);
             Controls.Add(banner);
@@ -175,7 +185,7 @@ namespace WorkBuddyLauncher
             SetState(ProjectState.Stopped, null);
             AppendLog("[INFO] 控制窗口已就绪，安装目录：" + _root);
 
-            Shown += delegate { ProbeAsync(); };
+            Shown += delegate { ProbeAsync(); CheckUpdateAsync(); };
         }
 
         private Panel _content;
@@ -689,8 +699,65 @@ namespace WorkBuddyLauncher
 
         private void OnTick(object sender, EventArgs e)
         {
+            // 新版本检查：每 900 拍（约 30 分钟）重查一次；用户关掉横幅后本次运行不再打扰
+            _updateTickCounter++;
+            if (!_updateDismissed && !_updateCheckRunning && _updateTickCounter >= 900)
+            {
+                _updateTickCounter = 0;
+                CheckUpdateAsync();
+            }
             if (_probing || _runner.IsRunning) { return; }
             ProbeAsync();
+        }
+
+        /// 读取本地版本（安装目录 .version，如 "v2.8.7"）；缺失返回空串（不检查）。
+        private string ReadLocalVersion()
+        {
+            try
+            {
+                var path = System.IO.Path.Combine(_root, ".version");
+                if (System.IO.File.Exists(path))
+                {
+                    return System.IO.File.ReadAllText(path).Trim();
+                }
+            }
+            catch { }
+            return string.Empty;
+        }
+
+        /// 后台查 GitHub 发布渠道，有新版时在 UI 线程弹出更新横幅（用户可关）。
+        private void CheckUpdateAsync()
+        {
+            if (_updateCheckRunning || _updateDismissed || IsDisposed) { return; }
+            _updateCheckRunning = true;
+            string localVersion = ReadLocalVersion();
+            Task.Factory.StartNew(delegate { return UpdateBanner.CheckNewer(localVersion); })
+                .ContinueWith(delegate(Task<string> task)
+                {
+                    _updateCheckRunning = false;
+                    if (IsDisposed || _updateDismissed) { return; }
+                    if (!task.IsFaulted && task.Result != null)
+                    {
+                        ShowUpdateBanner(task.Result);
+                    }
+                }, TaskScheduler.FromCurrentSynchronizationContext());
+        }
+
+        private void ShowUpdateBanner(string latestTag)
+        {
+            if (_updateBanner == null || IsDisposed) { return; }
+            if (_updateBanner.Visible)
+            {
+                // 已在展示：版本号变了才重建（同 tag 不闪动）
+                if (_updateBanner.LatestTag == latestTag) { return; }
+                _updateBanner.Visible = false;
+            }
+            _updateBanner = new UpdateBanner(latestTag);
+            _updateBanner.Dismissed += delegate { _updateDismissed = true; };
+            Controls.Add(_updateBanner);
+            _updateBanner.BringToFront(); // 内容面板之上、标题横幅之下（见构造函数注释）
+            _updateBanner.Visible = true;
+            AppendLog("[INFO] 发现新版本 " + latestTag + "，点击横幅可前往发布页下载最新安装包");
         }
 
         private void ProbeAsync()
