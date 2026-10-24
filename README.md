@@ -19,7 +19,7 @@
 
 > **维护状态**：这是 WorkBuddy Manager 的**社区延续版**，由 **AEmbers** 独立维护。
 > 原项目暂时停止更新后，本仓库继续提供面板、发布包、Windows 安装器、容器镜像和上游
-> 此fork版本源码补丁；后续版本、Issue 与更新均以
+> 此fork版本源码补丁；此fork后续版本、Issue 与更新均以
 > [AEmbers/workbuddy-manager](https://github.com/AEmbers/workbuddy-manager) 为准。
 
 <p align="center">
