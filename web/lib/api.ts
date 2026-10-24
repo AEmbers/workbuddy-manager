@@ -703,6 +703,10 @@ export const settingsApi = {
   modelMap: () => get<Record<string, string>>('/api/settings/model-map'),
   saveModelMap: (body: Record<string, string>) =>
     post<Record<string, string>>('/api/settings/model-map', body),
+  modelFallbacks: () =>
+    get<Record<string, string[]>>('/api/settings/model-fallbacks'),
+  saveModelFallbacks: (body: Record<string, string[]>) =>
+    post<Record<string, string[]>>('/api/settings/model-fallbacks', body),
   users: () => get<UserItem[]>('/api/users'),
   /** 管理端审计日志（登录/改密码/增删用户等，仅管理员可读） */
   auditLogs: (limit = 200) => get<AuditLogPage>('/api/audit-logs', {limit}),

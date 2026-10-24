@@ -227,7 +227,7 @@ class SourceIntrospectionTest(_Case):
                          'DOUBLE PRECISION')
 
     def test_rows_batched_and_projected(self) -> None:
-        keys = ['model_map', 'daily_tasks_plan', 'task_claim_schedule',
+        keys = ['model_map', 'model_fallbacks', 'daily_tasks_plan', 'task_claim_schedule',
                 'token_refresh_plan', 'proxy_pool']
         for key in keys:
             self.db.execute('INSERT INTO settings(key, value) VALUES(?, ?)',
@@ -237,11 +237,11 @@ class SourceIntrospectionTest(_Case):
             chunks = list(src.rows('settings', ['key'], 2))
         finally:
             src.close()
-        self.assertEqual([len(c) for c in chunks], [2, 2, 1])  # 按批切
+        self.assertEqual([len(c) for c in chunks], [2, 2, 2])  # 按批切
         self.assertIn(chunks[0][0][0], keys)                    # 只取投影的那一列
 
     def test_settings_rows_are_allowlisted(self) -> None:
-        for key in ('model_map', 'github_token', 'update_proxy',
+        for key in ('model_map', 'model_fallbacks', 'github_token', 'update_proxy',
                     'http_proxy', 'credits_snapshot'):
             self.db.execute('INSERT INTO settings(key, value) VALUES(?, ?)',
                             (key, 'x'))
@@ -252,6 +252,7 @@ class SourceIntrospectionTest(_Case):
         finally:
             src.close()
         self.assertIn('model_map', [row[0] for row in rows])
+        self.assertIn('model_fallbacks', [row[0] for row in rows])
         for secret in ('github_token', 'update_proxy', 'http_proxy',
                        'credits_snapshot'):
             self.assertNotIn(secret, [row[0] for row in rows])

@@ -45,7 +45,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import config, keysvc, upstreamsvc
-from ..services import image_budget
+from ..services import image_budget, modelfallback
 from . import gateway
 
 logger = logging.getLogger('workbuddy.responses')
@@ -274,7 +274,8 @@ def _event(name: str, payload: dict) -> bytes:
 
 
 def _failed(message: str, status: int, err_type: str = 'api_error',
-            code: str | None = None, hint: str | None = None) -> JSONResponse:
+            code: str | None = None, hint: str | None = None,
+            headers: dict[str, str] | None = None) -> JSONResponse:
     """错误回非流式 JSON（带状态码），而不是 SSE 错误帧。
 
     流一旦以 200 开始，状态码就固定了——错误只能裹在事件里，客户端会把它当作
@@ -282,7 +283,7 @@ def _failed(message: str, status: int, err_type: str = 'api_error',
 
     `hint` 透传上游的 `error.gateway_hint`（并列的可执行建议；为空时不写字段）。
     """
-    return gateway._oai_error(message, status, err_type, code, hint)
+    return gateway._oai_error(message, status, err_type, code, hint, headers)
 
 
 def _upstream_error_text(data: object, resp: object = None,
@@ -1771,10 +1772,34 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         return _failed(str(exc), 503, 'api_error', 'upstream_unavailable')
     url = f'{upstream["base_url"]}/v1/chat/completions'
     started = time.time()
+    scope = modelfallback.scope_for(
+        upstream["base_url"], upstreamsvc.forward_api_key(upstream),
+    )
+    raw_plan = gateway._fallback_plan(model, mapped, key)
+    if not raw_plan:
+        return _failed('model 不能为空', 400, 'invalid_request_error', 'invalid_model')
+    plan, cooldown_wait = modelfallback.available_plan(raw_plan, scope)
+    if not plan:
+        message, headers = modelfallback.local_cooldown(model, cooldown_wait)
+        gateway._record(
+            key, ip, model, raw_plan[0], 429, 0, 0,
+            int((time.time() - started) * 1000), ua, message, stream,
+            reasoning_effort=effort, client_channel=channel,
+        )
+        return _failed(
+            message, 429, 'rate_limit_error', 'model_rate_limited', headers=headers,
+        )
+    actual_model = plan[0]
 
     if not stream:
+        plan_index = 0
+        physical_attempts = 0
+        compression_retry_used = False
         try:
-            for attempt in range(2):
+            while plan_index < len(plan) and physical_attempts < modelfallback.MAX_ATTEMPTS:
+                actual_model = plan[plan_index]
+                payload['model'] = actual_model
+                physical_attempts += 1
                 async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
                     resp = await client.post(url, json=payload,
                                              headers=gateway._upstream_headers(upstream))
@@ -1788,7 +1813,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 # 整份 usage 交过去（而不是只取 credit）：扣费与提示词缓存三段
                 # 都在这一份里，分开取就会出现「某条协议缓存永远是空的」（issue #69）。
                 gateway._record(
-                    key, ip, model, mapped or '', resp.status_code,
+                    key, ip, model, actual_model, resp.status_code,
                     _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                     latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
                     usage=usage, reasoning_effort=effort,
@@ -1797,12 +1822,14 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 if resp.status_code >= 400:
                     message = _upstream_error_text(data, resp)
                     if (
-                        attempt == 0
+                        not compression_retry_used
                         and budget_stats.compressible_count > 0
+                        and physical_attempts < modelfallback.MAX_ATTEMPTS
                         and _is_image_budget_rejection(resp.status_code, message)
                     ):
+                        compression_retry_used = True
                         retry_payload = await _retry_payload_from_original(
-                            body, custom_tool_names, bridge, mapped, False,
+                            body, custom_tool_names, bridge, actual_model, False,
                             budget_stats.estimated_after,
                         )
                         if retry_payload is None:
@@ -1810,8 +1837,24 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                                            hint=gateway._error_hint(data))
                         payload = retry_payload
                         continue
+                    fallback_trigger = modelfallback.is_fallback_trigger(
+                        resp.status_code, data, getattr(resp, 'text', None),
+                    )
+                    if fallback_trigger:
+                        modelfallback.note_exhausted(
+                            scope, actual_model, getattr(resp, 'headers', {}), data,
+                            getattr(resp, 'text', None),
+                            allow_default=plan_index + 1 < len(plan),
+                        )
+                    if fallback_trigger and plan_index + 1 < len(plan):
+                        plan_index += 1
+                        continue
+                    headers = modelfallback.failure_headers(
+                        getattr(resp, 'headers', {}), data,
+                        getattr(resp, 'text', None),
+                    )
                     return _failed(message, resp.status_code,
-                                   hint=gateway._error_hint(data))
+                                   hint=gateway._error_hint(data), headers=headers)
                 if not isinstance(data, dict):
                     # 200 但响应体不是 JSON：不能当作「成功但空回答」返回。
                     return _failed('上游返回了无法解析的响应：' + resp.text[:300],
@@ -1819,7 +1862,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 return JSONResponse(
                     to_responses_object(data, model, resp_id, custom_tool_names, bridge)
                 )
-            raise AssertionError('non-stream retry loop must return')
+            raise AssertionError('non-stream model plan must return')
         except (CustomToolArgumentsError, ToolSearchArgumentsError) as exc:
             return _failed(
                 str(exc), 502, 'api_error',
@@ -1827,15 +1870,21 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 else 'invalid_custom_tool_arguments')
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
-            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua,
+            gateway._record(key, ip, model, actual_model, 502, 0, 0, latency, ua,
                             str(exc), False, reasoning_effort=effort,
                             client_channel=channel)
             return _failed(f'上游不可用：{exc}', 502)
 
     # ── 流式 ──
-    client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
-    resp = None
-    for attempt in range(2):
+    client = resp = None
+    plan_index = 0
+    physical_attempts = 0
+    compression_retry_used = False
+    while plan_index < len(plan) and physical_attempts < modelfallback.MAX_ATTEMPTS:
+        actual_model = plan[plan_index]
+        payload['model'] = actual_model
+        physical_attempts += 1
+        client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
         try:
             req = client.build_request('POST', url, json=payload,
                                        headers=gateway._upstream_headers(upstream))
@@ -1843,7 +1892,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         except Exception as exc:  # noqa: BLE001
             await client.aclose()
             latency = int((time.time() - started) * 1000)
-            gateway._record(key, ip, model, mapped or '', 502, 0, 0, latency, ua,
+            gateway._record(key, ip, model, actual_model, 502, 0, 0, latency, ua,
                             str(exc), True, reasoning_effort=effort,
                             client_channel=channel)
             return _failed(f'上游不可用：{exc}', 502)
@@ -1852,15 +1901,12 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         # real HTTP status and can be retried after stronger compression.
         if resp.status_code < 400:
             break
-        raw = b''
+        # send(..., stream=True) returns an HTTPX Response, which does not
+        # implement the async context-manager protocol. Read it directly.
+        raw = await modelfallback.read_error_body(resp)
         try:
-            # send(..., stream=True) returns an HTTPX Response, which does not
-            # implement the async context-manager protocol. Read it directly.
-            raw = await resp.aread()
-        except Exception:  # noqa: BLE001
-            raw = b''
-        finally:
             await resp.aclose()
+        finally:
             await client.aclose()
         text = raw.decode('utf-8', errors='replace')[:500]
         parsed = None
@@ -1869,18 +1915,20 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
         except ValueError:
             pass
         latency = int((time.time() - started) * 1000)
-        gateway._record(key, ip, model, mapped or '', resp.status_code, 0, 0, latency,
+        gateway._record(key, ip, model, actual_model, resp.status_code, 0, 0, latency,
                         ua, text, True, reasoning_effort=effort,
                         client_channel=channel)
         message = _upstream_error_text(parsed, None, fallback=text)
         if (
-            attempt == 0
+            not compression_retry_used
             and budget_stats.compressible_count > 0
+            and physical_attempts < modelfallback.MAX_ATTEMPTS
             and _is_image_budget_rejection(resp.status_code, message)
         ):
+            compression_retry_used = True
             try:
                 retry_payload = await _retry_payload_from_original(
-                    body, custom_tool_names, bridge, mapped, True,
+                    body, custom_tool_names, bridge, actual_model, True,
                     budget_stats.estimated_after,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -1889,9 +1937,27 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
                 return _failed(message, resp.status_code,
                                hint=gateway._error_hint(parsed))
             payload = retry_payload
-            client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
             continue
-        return _failed(message, resp.status_code, hint=gateway._error_hint(parsed))
+        fallback_trigger = modelfallback.is_fallback_trigger(
+            resp.status_code, parsed, text,
+        )
+        if fallback_trigger:
+            modelfallback.note_exhausted(
+                scope, actual_model, getattr(resp, 'headers', {}), parsed, text,
+                allow_default=plan_index + 1 < len(plan),
+            )
+        if fallback_trigger and plan_index + 1 < len(plan):
+            plan_index += 1
+            continue
+        headers = modelfallback.failure_headers(
+            getattr(resp, 'headers', {}), parsed, text,
+        )
+        return _failed(
+            message, resp.status_code, hint=gateway._error_hint(parsed),
+            headers=headers,
+        )
+    if resp is None or resp.status_code >= 400:
+        raise AssertionError('stream model plan must yield a successful response')
 
     async def gen():
         pending = ''
@@ -1977,7 +2043,7 @@ async def _handle(request: Request) -> JSONResponse | StreamingResponse:
             # 属于「值拿到了却没用上」——与本文件其它几处修过的同类问题一样。
             usage = translator.usage if isinstance(translator.usage, dict) else {}
             gateway._record(
-                key, ip, model, mapped or '', 200,
+                key, ip, model, actual_model, 200,
                 _as_int(usage.get('prompt_tokens')),
                 _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,

@@ -36,6 +36,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import config, db, iputil, keysvc, upstreamsvc
+from ..services import modelfallback
 from ..routers.security import get_config as get_security_config
 # responses 只为复用推理凭据的编解码（`_encode_credential` / `_decode_credential`）：
 # Anthropic 的 `signature` 与 Responses 的 `encrypted_content` 语义完全相同——
@@ -58,7 +59,8 @@ _STOP_REASON = {
 
 
 def _err(message: str, status: int = 400, err_type: str = 'invalid_request_error',
-         hint: str | None = None) -> JSONResponse:
+         hint: str | None = None,
+         headers: dict[str, str] | None = None) -> JSONResponse:
     """Anthropic 风格的错误体。
 
     与 OpenAI 的区别不只是字段名：Anthropic 把错误包在 `{"type":"error","error":{...}}`
@@ -71,7 +73,9 @@ def _err(message: str, status: int = 400, err_type: str = 'invalid_request_error
     err: dict = {'type': err_type, 'message': message}
     if hint:
         err['gateway_hint'] = hint
-    return JSONResponse({'type': 'error', 'error': err}, status_code=status)
+    return JSONResponse(
+        {'type': 'error', 'error': err}, status_code=status, headers=headers,
+    )
 
 
 def _as_int(value: object) -> int:
@@ -1047,64 +1051,184 @@ async def messages(request: Request):
         return _err(str(exc), 503, 'api_error')
     url = f'{upstream["base_url"]}/v1/chat/completions'
     started = time.time()
+    scope = modelfallback.scope_for(
+        upstream["base_url"], upstreamsvc.forward_api_key(upstream),
+    )
+    raw_plan = gateway._fallback_plan(model, mapped, key)
+    if not raw_plan:
+        return _err('model 不能为空')
+    plan, cooldown_wait = modelfallback.available_plan(raw_plan, scope)
+    if not plan:
+        message, headers = modelfallback.local_cooldown(model, cooldown_wait)
+        gateway._record(
+            key, ip, model, raw_plan[0], 429, 0, 0,
+            int((time.time() - started) * 1000), ua, message, stream,
+            reasoning_effort=effort, client_channel=channel,
+        )
+        return _err(
+            message, 429, 'rate_limit_error', headers=headers,
+        )
+    actual_model = plan[0]
 
     if not stream:
+        plan_index = 0
+        physical_attempts = 0
         try:
-            async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
-                resp = await client.post(url, json=payload,
-                                         headers=gateway._upstream_headers(upstream))
-            latency = int((time.time() - started) * 1000)
-            usage: dict = {}
-            try:
-                data = resp.json()
-                usage = data.get('usage') or {}
-            except Exception:  # noqa: BLE001
-                data = None
-            # 整份 usage 交过去（而不是只取 credit）：扣费与提示词缓存三段
-            # 都在这一份里，分开取就会出现「某条协议缓存永远是空的」（issue #69）。
-            gateway._record(
-                key, ip, model, mapped or '', resp.status_code,
-                _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
-                latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
-                usage=usage, reasoning_effort=effort, client_channel=channel,
-            )
-            if resp.status_code >= 400:
-                msg = ''
-                if isinstance(data, dict):
-                    err_obj = data.get('error')
-                    msg = str(err_obj.get('message') if isinstance(err_obj, dict) else err_obj) or str(data)[:300]
-                else:
-                    msg = resp.text[:300]
-                return _err(msg, resp.status_code, 'api_error',
-                            hint=gateway._error_hint(data))
-            return JSONResponse(to_anthropic_response(
-                data if isinstance(data, dict) else {}, model, thinking=want_thinking))
+            while plan_index < len(plan) and physical_attempts < modelfallback.MAX_ATTEMPTS:
+                actual_model = plan[plan_index]
+                payload['model'] = actual_model
+                physical_attempts += 1
+                async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
+                    resp = await client.post(
+                        url, json=payload, headers=gateway._upstream_headers(upstream),
+                    )
+                latency = int((time.time() - started) * 1000)
+                usage: dict = {}
+                try:
+                    data = resp.json()
+                    usage = data.get('usage') or {}
+                except Exception:  # noqa: BLE001
+                    data = None
+                # 整份 usage 交过去（而不是只取 credit）：扣费与提示词缓存三段
+                # 都在这一份里，分开取就会出现「某条协议缓存永远是空的」（issue #69）。
+                gateway._record(
+                    key, ip, model, actual_model, resp.status_code,
+                    _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
+                    latency, ua, None if resp.status_code < 400 else str(data)[:500], False,
+                    usage=usage, reasoning_effort=effort, client_channel=channel,
+                )
+                if resp.status_code >= 400:
+                    msg = ''
+                    if isinstance(data, dict):
+                        err_obj = data.get('error')
+                        msg = str(
+                            err_obj.get('message')
+                            if isinstance(err_obj, dict) else err_obj
+                        ) or str(data)[:300]
+                    else:
+                        msg = resp.text[:300]
+                    fallback_trigger = modelfallback.is_fallback_trigger(
+                        resp.status_code, data, getattr(resp, 'text', None),
+                    )
+                    if fallback_trigger:
+                        modelfallback.note_exhausted(
+                            scope, actual_model, getattr(resp, 'headers', {}), data,
+                            getattr(resp, 'text', None),
+                            allow_default=plan_index + 1 < len(plan),
+                        )
+                    if fallback_trigger and plan_index + 1 < len(plan):
+                        plan_index += 1
+                        continue
+                    headers = modelfallback.failure_headers(
+                        getattr(resp, 'headers', {}), data,
+                        getattr(resp, 'text', None),
+                    )
+                    return _err(
+                        msg, resp.status_code, 'api_error',
+                        hint=gateway._error_hint(data), headers=headers,
+                    )
+                return JSONResponse(to_anthropic_response(
+                    data if isinstance(data, dict) else {}, model, thinking=want_thinking))
+            raise AssertionError('non-stream model plan must return')
         except Exception as exc:  # noqa: BLE001
             latency = int((time.time() - started) * 1000)
             gateway._record(
-                key, ip, model, mapped or '', 502, 0, 0, latency,
+                key, ip, model, actual_model, 502, 0, 0, latency,
                 ua, str(exc), False, reasoning_effort=effort,
                 client_channel=channel,
             )
             return _err(f'上游不可用：{exc}', 502, 'api_error')
 
     # ── 流式 ────────────────────────────────────────────────
-    client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
-    try:
-        req = client.build_request('POST', url, json=payload,
-                                   headers=gateway._upstream_headers(upstream))
-        resp = await client.send(req, stream=True)
-    except Exception as exc:  # noqa: BLE001
-        await client.aclose()
+    client = resp = None
+    status_code = 0
+    plan_index = 0
+    physical_attempts = 0
+    while plan_index < len(plan) and physical_attempts < modelfallback.MAX_ATTEMPTS:
+        actual_model = plan[plan_index]
+        payload['model'] = actual_model
+        physical_attempts += 1
+        client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
+        try:
+            req = client.build_request(
+                'POST', url, json=payload, headers=gateway._upstream_headers(upstream),
+            )
+            resp = await client.send(req, stream=True)
+        except Exception as exc:  # noqa: BLE001
+            await client.aclose()
+            latency = int((time.time() - started) * 1000)
+            gateway._record(
+                key, ip, model, actual_model, 502, 0, 0, latency,
+                ua, str(exc), True, reasoning_effort=effort,
+                client_channel=channel,
+            )
+            return _err(f'上游不可用：{exc}', 502, 'api_error')
+
+        status_code = resp.status_code
+        if status_code < 400:
+            break
+        raw_bytes = await modelfallback.read_error_body(resp)
+        try:
+            await resp.aclose()
+        finally:
+            await client.aclose()
+        raw_text = raw_bytes.decode('utf-8', errors='replace')[:500]
+        try:
+            data = json.loads(raw_text)
+        except (TypeError, ValueError):
+            data = None
         latency = int((time.time() - started) * 1000)
         gateway._record(
-            key, ip, model, mapped or '', 502, 0, 0, latency,
-            ua, str(exc), True, reasoning_effort=effort,
-            client_channel=channel,
+            key, ip, model, actual_model, status_code, 0, 0, latency,
+            ua, raw_text, True, reasoning_effort=effort, client_channel=channel,
         )
-        return _err(f'上游不可用：{exc}', 502, 'api_error')
+        msg = ''
+        if isinstance(data, dict):
+            err_obj = data.get('error')
+            msg = str(
+                err_obj.get('message') if isinstance(err_obj, dict) else err_obj
+            ) or str(data)[:300]
+        else:
+            msg = raw_text[:300]
+        fallback_trigger = modelfallback.is_fallback_trigger(
+            status_code, data, raw_text,
+        )
+        if fallback_trigger:
+            modelfallback.note_exhausted(
+                scope, actual_model, getattr(resp, 'headers', {}), data, raw_text,
+                allow_default=plan_index + 1 < len(plan),
+            )
+        if fallback_trigger and plan_index + 1 < len(plan):
+            plan_index += 1
+            continue
+        headers = modelfallback.failure_headers(
+            getattr(resp, 'headers', {}), data, raw_text,
+        )
+        if fallback_trigger:
+            return _err(
+                msg, status_code, 'api_error',
+                hint=gateway._error_hint(data), headers=headers,
+            )
 
-    status_code = resp.status_code
+        # Preserve the Anthropic streaming contract for non-exhaustion errors:
+        # clients need an `error` event before `message_stop`, not a silently
+        # successful empty stream.  The fallback-exhaustion branch above keeps
+        # the real upstream HTTP status because those are retryable failures.
+        async def legacy_error_stream():
+            yield _event('error', {
+                'type': 'error',
+                'error': {'type': 'api_error', 'message': msg or raw_text},
+            })
+            translator = _StreamTranslator(model, thinking=want_thinking)
+            for event in translator.finish(None, force=True):
+                yield event
+
+        return StreamingResponse(
+            legacy_error_stream(), status_code=200,
+            media_type='text/event-stream', headers=headers,
+        )
+    if resp is None or resp.status_code >= 400:
+        raise AssertionError('stream model plan must yield a successful response')
 
     async def gen():
         usage: dict = {}
@@ -1211,7 +1335,7 @@ async def messages(request: Request):
             await client.aclose()
             latency = int((time.time() - started) * 1000)
             gateway._record(
-                key, ip, model, mapped or '', status_code,
+                key, ip, model, actual_model, status_code,
                 _as_int(usage.get('prompt_tokens')), _as_int(usage.get('completion_tokens')),
                 latency, ua, error_text, True,
                 usage=usage, first_token=first_token_ms,

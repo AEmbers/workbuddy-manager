@@ -821,18 +821,6 @@ export function ManagementBar() {
                     <div className="text-[11px] font-medium text-muted-foreground">{t('profile.quickLinks')}</div>
                     <div className="flex flex-wrap items-center gap-2">
                       <Link
-                        href="https://linux.do"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-2 rounded-full bg-muted px-3 py-2 transition-colors hover:bg-muted/80"
-                        title={t('profile.communityTitle')}
-                      >
-                        <div className="flex items-center gap-2">
-                          <Users className="size-3.5 text-foreground/60" />
-                          <span className="text-xs font-medium text-foreground">{t('profile.community')}</span>
-                        </div>
-                      </Link>
-                      <Link
                         href="https://github.com/Sliverkiss/workbuddy2api"
                         target="_blank"
                         rel="noopener noreferrer"

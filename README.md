@@ -4,7 +4,7 @@
 
 **腾讯 CodeBuddy 账号池管理控制台 · OpenAI 兼容反代网关**
 
-面向 [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api) 的 Web 管理端：扫码纳管、定时签到与保活、密钥分发、IP 与模型白名单、日志与用量统计；上游源码随发布包分发（MIT），迁移见[部署指南](deploy/README.md#〇上游源码从哪来随发布包分发)。
+腾讯 CodeBuddy 账号池的 Web 管理端与 OpenAI 兼容反代网关：扫码纳管、定时签到与保活、密钥分发、IP 与模型白名单、日志与用量统计。项目在原始版本停更后由 AEmbers 接续维护，上游 Go 源码以补丁形式继续维护并随发布包分发（MIT）；迁移见[部署指南](deploy/README.md#〇上游源码从哪来随发布包分发)。
 
 ![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)
@@ -15,21 +15,16 @@
 [![Changelog](https://img.shields.io/badge/更新日志-CHANGELOG-blue)](CHANGELOG.md)
 [![Issues](https://img.shields.io/github/issues/AEmbers/workbuddy-manager?color=f59e0b&label=反馈)](https://github.com/AEmbers/workbuddy-manager/issues)
 
-[English](README.en.md) · **简体中文** ｜ 本项目在 [LINUX DO](https://linux.do) 社区发布与交流
+[English](README.en.md) · **简体中文**
 
-> **维护状态**：原 `ithtelab/workbuddy-manager` 在 v2.8.3 后停止更新。
-> 本仓库现由 **AEmbers** 独立维护，后续版本、Issue、更新包与容器镜像均以
+> **维护状态**：这是 WorkBuddy Manager 的**社区延续版**，由 **AEmbers** 独立维护。
+> 原项目停止更新后，本仓库继续提供面板、发布包、Windows 安装器、容器镜像和上游
+> 源码补丁；后续版本、Issue 与更新均以
 > [AEmbers/workbuddy-manager](https://github.com/AEmbers/workbuddy-manager) 为准。
 
 <p align="center">
   <strong>⚠️ 使用边界：</strong>本项目只用于管理<strong>本人及亲属自愿授权</strong>的账号；禁止批量注册、账号交易、代注册、接码、盗号、绕过平台风控，以及任何商业转售或盈利性用途。使用即表示你已阅读并同意<a href="#使用边界与免责声明">完整免责声明</a>。
 </p>
-
-<a href="https://proxylane.dev/?utm_source=workbuddy-manager&utm_medium=partnership&utm_campaign=workbuddy-manager_sponsor_202610&utm_content=github_readme"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助位）" width="100%" /></a>
-
-**赞助商**：[ProxyLane](https://proxylane.dev/?utm_source=workbuddy-manager&utm_medium=partnership&utm_campaign=workbuddy-manager_sponsor_202610&utm_content=github_readme) 住宅代理，覆盖 195 个国家，95%+ IP 获 Scamalytics 低风险评级。在 `WB_HTTP_PROXY` 的用户名里写上国家、城市和会话名，每个实例走一个住宅 IP，最长 72 小时不变，换 IP 也留在同一城市。
-
-首次购买使用优惠码 `WORKBUDDY30` 享 7 折。
 
 <img src="docs/images/dashboard.png" alt="WorkBuddy Manager 仪表盘" width="100%" />
 
@@ -41,9 +36,8 @@
 
 ## 这是什么
 
-`workbuddy2api` 是一个把腾讯 CodeBuddy 账号池包装成 OpenAI 兼容接口的反代服务（Go 编写）。它的能力很完整，但只有命令行：加账号要跑脚本、看状态要 `curl /status`、发密钥没有界面。
-
-本项目补上这一块 —— 一个可以公网运营的 Web 控制台：
+WorkBuddy Manager 是面向腾讯 CodeBuddy 账号池的自部署控制台与 OpenAI 兼容反代网关。
+它把账号、密钥、代理、用量、日志、定时任务和上游服务集中到一个 Web 界面里：
 
 | 你原本要做的 | 现在在面板上 |
 |---|---|
@@ -54,20 +48,13 @@
 | 无法知道谁用了多少 | 每次调用的模型、Token、延迟、来源 IP 全量留痕 |
 | 无任何 IP 防护 | 入站白/黑名单 + 每密钥 IP 上限与白名单 |
 
-**与 workbuddy2api 的关系**：本项目是为它做**可视化**的配套项目 —— 让能力强大的
-上游网关变得看得见、管得动。面板不侵入上游：**没有修改它一行代码**，账号轮询、
-并发与熔断仍由它负责。两者配合的方式很自然：
+**维护关系**：本项目在原始 WorkBuddy Manager 与 workbuddy2api 停止公开维护后接续
+开发。现在管理端、Go 上游补丁、Issue、Release、Windows 安装器和容器镜像都由
+AEmbers 维护。原始项目仅作为代码来源与 MIT 归属记录，不表示原作者仍在参与，
+也不表示双方存在赞助、认证或背书关系。
 
-- **上游负责能力，面板负责呈现**：账号调度、令牌刷新、限流熔断由 workbuddy2api
-  完成；面板把这些能力可视化，并补上密钥分发、IP 管控、用量统计这些运营环节
-- **互为参照、一起演进**：上游新增能力时本项目跟随适配，面板侧发现的运营需求也
-  会反哺上游。上游在它的 README 里把本项目列为「社区前端面板」之一，我们希望
-  一起把这个生态做得更好用
-- **上游专注自己的核心**：面板不要求上游为它改代码，让上游能保持精简
-
-欢迎参与共建：面板与上游源码的问题、想法都提到
-[本仓库](https://github.com/AEmbers/workbuddy-manager/issues)
-（上游源码随本项目的发布包分发）。
+欢迎参与共建；面板功能和随包上游源码的问题都提到
+[本仓库](https://github.com/AEmbers/workbuddy-manager/issues)。
 
 ---
 
@@ -86,6 +73,8 @@
 - **OpenAI 兼容** —— 标准 SDK 直连，流式与非流式都支持
 - **多密钥分发** —— 每把密钥独立设版本、有效期、IP 数、IP / 模型白名单与额度
 - **模型别名映射** —— 把下游在用的名字映到实际模型，迁移无感
+- **模型限流降级链** —— 明确遇到 6004 或账号池耗尽时，最多尝试 3 个后备模型；
+  同时透传冷却时间并阻止客户端立刻重复重试
 - **模型中心** —— 账号可用模型单列一页：上下文、最大输出、思考档位
 - **全量审计** —— 每次调用记密钥、IP、模型、状态码、首字延迟、扣费与缓存命中
 
@@ -246,8 +235,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/AEmbers/workbuddy-manager/ma
   [功能建议](https://github.com/AEmbers/workbuddy-manager/issues/new?template=feature_request.yml)
 
 > 反馈时请附上版本号与错误日志，并**先移除其中的密钥、Token 等敏感信息**。
-> 上游 workbuddy2api 自身的问题也提到[本仓库](https://github.com/AEmbers/workbuddy-manager/issues)
-> ——上游源码随本项目的发布包分发。
+> 随包 workbuddy2api 源码的问题也提到[本仓库](https://github.com/AEmbers/workbuddy-manager/issues)。
 
 ### 版本发布流程
 
@@ -276,8 +264,8 @@ CI 会构建前端、打包产物、从 CHANGELOG 提取对应版本段落作为
 
 ## 致谢
 
-- [**LINUX DO**](https://linux.do) —— 本项目的发布与交流社区
 - [**linux-do/cdk**](https://github.com/linux-do/cdk)（MIT）—— 界面设计令牌与浮动底栏组件来源，本项目 UI 视觉与其保持一致
+- [**ithtelab/workbuddy-manager**](https://github.com/ithtelab/workbuddy-manager) —— 本项目延续的历史管理端（MIT，v2.8.3 后停止更新）
 - [**Sliverkiss/workbuddy2api**](https://github.com/Sliverkiss/workbuddy2api) —— 底层账号池与 OpenAI 兼容代理（MIT；源码随本项目的发布包分发，版权归原作者）
 - [**lbjlaq/Antigravity-Manager**](https://github.com/lbjlaq/Antigravity-Manager) —— 管理端功能形态参考
 

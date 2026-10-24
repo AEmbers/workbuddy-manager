@@ -955,6 +955,7 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
   const {values, errors, isRefreshing, reload} = useAsyncAll({
     cfg: () => settingsApi.upstream(),
     modelMap: () => settingsApi.modelMap(),
+    modelFallbacks: () => settingsApi.modelFallbacks(),
     users: () => settingsApi.users(),
   }, []);
 
@@ -972,6 +973,12 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
   /** 模型映射的乐观值：保存成功后、刷新落地前先显示新值（见 saveModelMap） */
   const [optimisticMap, setOptimisticMap] = useState<Record<string, string> | null>(null);
   const modelMap: Record<string, string> = optimisticMap ?? values.modelMap ?? {};
+  const [optimisticFallbacks, setOptimisticFallbacks] =
+    useState<Record<string, string[]> | null>(null);
+  const modelFallbacks: Record<string, string[]> =
+    optimisticFallbacks ?? values.modelFallbacks ?? {};
+  const [fallbackPrimary, setFallbackPrimary] = useState('');
+  const [fallbackTarget, setFallbackTarget] = useState('');
 
   const [models, setModels] = useState<ModelInfo[]>([]);
   /** 模型列表来源：dynamic = 上游实时拉取，static = 上游内置回退表 */
@@ -1258,6 +1265,19 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
       if (await reload()) setOptimisticMap(null);
     } catch (e) {
       setOptimisticMap(null);
+      notify.err(errText(e));
+    }
+  }
+
+  /** 模型限流降级链；与模型映射独立保存，避免影响别名语义。 */
+  async function saveModelFallbacks(next: Record<string, string[]>) {
+    setOptimisticFallbacks(next);
+    try {
+      await settingsApi.saveModelFallbacks(next);
+      notify.ok(t('settings.fallbackSaved'));
+      if (await reload()) setOptimisticFallbacks(null);
+    } catch (e) {
+      setOptimisticFallbacks(null);
       notify.err(errText(e));
     }
   }
@@ -2029,6 +2049,132 @@ export default function SettingsLayout({children}: {children: React.ReactNode}) 
             {!Object.keys(modelMap).length && (
               <div className="py-10 text-center text-xs text-muted-foreground">
                 {t('settings.mapEmpty')}
+              </div>
+            )}
+          </div>
+
+          <div className="rounded-[20px] bg-muted p-4">
+            <div className="mb-1 text-sm font-medium">{t('settings.fallbackTitle')}</div>
+            <div className="mb-3 text-[11px] leading-5 text-muted-foreground">
+              <RichText text={t('settings.fallbackDesc')} />
+            </div>
+            <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-4">
+              <div className="space-y-1.5">
+                <Label className="text-[11px] text-muted-foreground">
+                  {t('settings.fallbackPrimary')}
+                </Label>
+                <Input
+                  value={fallbackPrimary}
+                  onChange={(e) => setFallbackPrimary(e.target.value)}
+                  placeholder="deepseek-v4.1-flash"
+                  className="bg-background font-mono text-xs"
+                  disabled={!isAdmin}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-[11px] text-muted-foreground">
+                  {t('settings.fallbackTarget')}
+                </Label>
+                <Input
+                  value={fallbackTarget}
+                  onChange={(e) => setFallbackTarget(e.target.value)}
+                  placeholder="deepseek-v4-pro"
+                  className="bg-background font-mono text-xs"
+                  disabled={!isAdmin}
+                />
+              </div>
+              <div className="sm:col-span-2">
+                <Button
+                  className="rounded-full"
+                  disabled={
+                    !isAdmin ||
+                    !fallbackPrimary.trim() ||
+                    !fallbackTarget.trim() ||
+                    fallbackPrimary.trim() === fallbackTarget.trim()
+                  }
+                  onClick={() => {
+                    const primary = fallbackPrimary.trim();
+                    const target = fallbackTarget.trim();
+                    const chain = modelFallbacks[primary] || [];
+                    if (chain.includes(target)) {
+                      notify.err(t('settings.fallbackDuplicate'));
+                      return;
+                    }
+                    if (chain.length >= 3) {
+                      notify.err(t('settings.fallbackMax'));
+                      return;
+                    }
+                    saveModelFallbacks({
+                      ...modelFallbacks,
+                      [primary]: [...chain, target],
+                    });
+                    setFallbackPrimary('');
+                    setFallbackTarget('');
+                  }}
+                >
+                  <Plus />
+                  {t('settings.fallbackAdd')}
+                </Button>
+                {fallbackPrimary.trim() &&
+                  fallbackPrimary.trim() === fallbackTarget.trim() && (
+                    <div className="mt-1 text-[10px] text-red-600 dark:text-red-400">
+                      {t('settings.fallbackSelf')}
+                    </div>
+                  )}
+              </div>
+            </div>
+            <div className="mt-2 text-[10px] text-muted-foreground">
+              {t('settings.fallbackLimit')}
+            </div>
+          </div>
+
+          <div className="overflow-hidden rounded-[20px] bg-muted">
+            <Table>
+              <TableHeader>
+                <TableRow className="border-b border-border/60 hover:bg-transparent">
+                  <TableHead className="pl-4 text-[11px] text-muted-foreground">
+                    {t('settings.fallbackPrimary')}
+                  </TableHead>
+                  <TableHead className="text-[11px] text-muted-foreground">
+                    {t('settings.fallbackChain')}
+                  </TableHead>
+                  {isAdmin && (
+                    <TableHead className="pr-4 text-right text-[11px] text-muted-foreground">
+                      {t('accounts.colActions')}
+                    </TableHead>
+                  )}
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {Object.entries(modelFallbacks).map(([primary, chain]) => (
+                  <TableRow key={primary} className="border-b border-border/40">
+                    <TableCell className="pl-4 font-mono text-xs">{primary}</TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">
+                      {[primary, ...chain].join(' → ')}
+                    </TableCell>
+                    {isAdmin && (
+                      <TableCell className="pr-4 text-right">
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7 rounded-md text-red-500 hover:text-red-600"
+                          onClick={() => {
+                            const next = {...modelFallbacks};
+                            delete next[primary];
+                            saveModelFallbacks(next);
+                          }}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </Button>
+                      </TableCell>
+                    )}
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            {!Object.keys(modelFallbacks).length && (
+              <div className="py-10 text-center text-xs text-muted-foreground">
+                {t('settings.fallbackEmpty')}
               </div>
             )}
           </div>

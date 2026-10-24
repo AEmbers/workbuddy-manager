@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from .. import db, security
 from ..iputil import client_ip
-from ..services import modelmap, reload, updater, wb2api
+from ..services import modelfallback, modelmap, reload, updater, wb2api
 
 router = APIRouter(prefix='/api', tags=['settings'])
 
@@ -113,6 +113,25 @@ def save_model_map(body: dict[str, str], user: dict = Depends(security.require_a
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     db.set_setting('model_map', clean)
+    return clean
+
+
+# ── 模型限流降级链 ────────────────────────────────────────
+@router.get('/settings/model-fallbacks')
+def get_model_fallbacks(user: dict = Depends(security.current_user)) -> dict:
+    """读取受限的模型降级链；坏数据按未配置处理。"""
+    return modelfallback.load(db.get_setting('model_fallbacks', {}) or {})
+
+
+@router.post('/settings/model-fallbacks')
+def save_model_fallbacks(body: dict, user: dict = Depends(security.require_admin)) -> dict:
+    """保存 `{主模型: [降级模型...]}`，每链最多三个候选。"""
+    try:
+        clean = modelfallback.validate(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    db.set_setting('model_fallbacks', clean)
+    security.audit(user, 'update_model_fallbacks', '', f'{len(clean)} 条链')
     return clean
 
 # ── GitHub Token（版本检测 / 一键更新）────────────────────

@@ -399,6 +399,22 @@ class WebPhraseTest(unittest.TestCase):
                               f'{code} 的短语表缺这条拼接文案（界面会漏翻）：{text[:40]}…')
 
 
+class IndependentBrandingTest(unittest.TestCase):
+    """AEmbers 独立维护后，不再把上游社区的推广挂在产品界面里。"""
+
+    def test_personal_panel_has_no_upstream_community_promotion(self) -> None:
+        source = (
+            _ROOT / 'web' / 'components' / 'common' / 'layout' / 'ManagementBar.tsx'
+        ).read_text(encoding='utf-8')
+        self.assertNotIn('https://linux.do', source)
+        self.assertNotIn('profile.community', source)
+
+        for locale in _LOCALES:
+            profile = _load(locale).get('profile', {})
+            self.assertNotIn('community', profile, f'{locale} 仍保留社区推广文案')
+            self.assertNotIn('communityTitle', profile, f'{locale} 仍保留社区推广说明')
+
+
 class AlwaysFailingBadgeTest(unittest.TestCase):
     """账号页「一直失败」徽章的判据（issue #14 第二点）。
 

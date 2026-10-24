@@ -4,7 +4,7 @@
 
 **Management console for Tencent CodeBuddy account pools · OpenAI-compatible gateway**
 
-A web console for [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api): QR onboarding, scheduled check-in and keep-alive, per-group key distribution, IP and model allowlists, request logs and usage stats; the upstream source ships inside the release package (MIT) — see the [deployment guide](deploy/README.md#〇上游源码从哪来随发布包分发) for migration.
+A web console and OpenAI-compatible gateway for Tencent CodeBuddy account pools: QR onboarding, scheduled check-in and keep-alive, key distribution, IP and model allowlists, request logs and usage stats. After the original project stopped public maintenance, AEmbers continues development here; the upstream Go source is maintained as patches and ships inside the release package (MIT) — see the [deployment guide](deploy/README.md#〇上游源码从哪来随发布包分发) for migration.
 
 ![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)
@@ -15,22 +15,17 @@ A web console for [`workbuddy2api`](https://github.com/Sliverkiss/workbuddy2api)
 [![Changelog](https://img.shields.io/badge/Changelog-CHANGELOG-blue)](CHANGELOG.md)
 [![Issues](https://img.shields.io/github/issues/AEmbers/workbuddy-manager?color=f59e0b&label=Issues)](https://github.com/AEmbers/workbuddy-manager/issues)
 
-**English** · [简体中文](README.md) ｜ Documented and discussed in the [LINUX DO](https://linux.do) community
+**English** · [简体中文](README.md)
 
-> **Maintenance status**: The original `ithtelab/workbuddy-manager` stopped
-> after v2.8.3. This fork is now independently maintained by **AEmbers**;
-> subsequent releases, issues, update packages, and container images come from
+> **Maintenance status**: This is the **community continuation** of WorkBuddy
+> Manager, independently maintained by **AEmbers** after the original project
+> stopped updating. The console, release packages, Windows installer, container
+> images and upstream source patches are now maintained at
 > [AEmbers/workbuddy-manager](https://github.com/AEmbers/workbuddy-manager).
 
 <p align="center">
   <strong>⚠️ Intended use:</strong> this project is only for managing accounts that <strong>you or your family members have voluntarily authorized</strong>. Bulk registration, account trading, registration-on-behalf, SMS-code farming, account theft, bypassing platform risk controls, resale, or any for-profit use are prohibited. By using this project you agree to the <a href="#intended-use--disclaimer">full disclaimer</a>.
 </p>
-
-<a href="https://proxylane.dev/?utm_source=workbuddy-manager&utm_medium=partnership&utm_campaign=workbuddy-manager_sponsor_202610&utm_content=github_readme_en"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane (sponsor)" width="100%" /></a>
-
-**Sponsor**: [ProxyLane](https://proxylane.dev/?utm_source=workbuddy-manager&utm_medium=partnership&utm_campaign=workbuddy-manager_sponsor_202610&utm_content=github_readme_en) residential proxies in 195 countries, 95%+ of IPs rated low risk by Scamalytics. Put the country, city and a session name in the `WB_HTTP_PROXY` username: each instance gets one residential IP for up to 72 hours, and a replacement IP stays in the same city.
-
-New customers get 30% off the first purchase with code `WORKBUDDY30`.
 
 <img src="docs/images/dashboard.png" alt="WorkBuddy Manager dashboard" width="100%" />
 
@@ -42,12 +37,9 @@ New customers get 30% off the first purchase with code `WORKBUDDY30`.
 
 ## What is this
 
-`workbuddy2api` (its original repository has been deleted by its author) wraps a Tencent CodeBuddy
-account pool into an OpenAI-compatible API (written in Go). Its capabilities are complete,
-but they are command-line only: adding an account means running a script, checking status
-means `curl /status`, and handing out API keys has no interface at all.
-
-This project fills that gap — a web console you can safely run on the public internet:
+WorkBuddy Manager is a self-hosted console and OpenAI-compatible gateway for Tencent
+CodeBuddy account pools. It brings accounts, keys, proxies, usage, logs, scheduled tasks
+and the upstream service together in one web interface:
 
 | What you used to do | What you do now |
 |---|---|
@@ -58,25 +50,15 @@ This project fills that gap — a web console you can safely run on the public i
 | No idea who consumed how much | Every call is logged: model, tokens, latency, source IP |
 | No IP protection at all | Inbound allow/deny lists plus per-key IP limits and allowlists |
 
-> **Not a single line of workbuddy2api is modified.** Account rotation, concurrency and
-> circuit breaking stay its job; this project is a separate console and gateway.
+**Maintenance relationship**: this project continues development after the original
+WorkBuddy Manager and workbuddy2api stopped public maintenance. The console, Go upstream
+patches, issues, releases, Windows installer and container images are maintained by
+AEmbers. The historical projects are credited as code origins under MIT; this does not
+mean that their authors still participate or that either side sponsors, certifies or
+endorses this continuation.
 
-**How this relates to workbuddy2api**: this project is the **visual companion** to it —
-it makes a capable upstream gateway visible and manageable. The two fit together naturally:
-
-- **The upstream provides the capabilities, the panel presents them**: account scheduling,
-  token refresh and circuit breaking are workbuddy2api's job; the panel visualises those
-  capabilities and adds the operational side — key distribution, IP control, usage stats
-- **We learn from each other and evolve together**: when the upstream gains a capability
-  this project follows, and operational needs discovered on the panel side feed back to the
-  upstream. The upstream lists this project among its "community front-end panels", and we
-  hope to make that ecosystem better together
-- **The upstream stays focused on its core**: the panel does not ask the upstream to change
-  code for it, so the upstream can stay lean
-
-Contributions are welcome: both panel and upstream-source issues and ideas belong in
-[this repository](https://github.com/AEmbers/workbuddy-manager/issues) — the original
-upstream repo is gone, and its source is now maintained here.
+Contributions are welcome; issues for both the console and bundled upstream source belong
+in [this repository](https://github.com/AEmbers/workbuddy-manager/issues).
 
 ---
 
@@ -95,6 +77,8 @@ upstream repo is gone, and its source is now maintained here.
 - **OpenAI compatible** — standard SDKs connect directly; streaming and non-streaming
 - **Key distribution** — per-key realm, expiry, IP count, IP / model allowlists and quota
 - **Model aliases** — map the names your downstream uses onto the real models
+- **Rate-limit fallback chains** — on an explicit 6004 or exhausted pool, try up
+  to three configured fallback models while carrying cooldown and retry-stop headers
 - **Model centre** — every usable model on one page: context, max output, thinking tiers
 - **Full audit trail** — key, IP, model, status, TTFB, billing and cache hits per call
 
@@ -244,9 +228,8 @@ Threat model and hardening notes: [security notes](docs/security-notes.md) and t
   [request a feature](https://github.com/AEmbers/workbuddy-manager/issues/new?template=feature_request.yml)
 
 > Please include the version and error logs, and **remove any keys or tokens first**.
-> For issues with the upstream workbuddy2api itself, use
-> [this repository](https://github.com/AEmbers/workbuddy-manager/issues) — the upstream
-> source ships with our releases.
+> Issues with the bundled workbuddy2api source also belong in
+> [this repository](https://github.com/AEmbers/workbuddy-manager/issues).
 
 ### Release process
 
@@ -277,9 +260,10 @@ release notes, and creates a Release with the archives attached.
 
 ## Credits
 
-- [**LINUX DO**](https://linux.do) — the community where this project is published and discussed
 - [**linux-do/cdk**](https://github.com/linux-do/cdk) (MIT) — design tokens and floating
   dock component; this project's UI follows its visual language
+- [**ithtelab/workbuddy-manager**](https://github.com/ithtelab/workbuddy-manager) — the
+  predecessor console continued by this project (MIT; stopped after v2.8.3)
 - [**Sliverkiss/workbuddy2api**](https://github.com/Sliverkiss/workbuddy2api) — the account
   pool and OpenAI-compatible proxy underneath (MIT; its source is distributed with
   this project's releases)

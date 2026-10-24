@@ -19,7 +19,10 @@ from .routers import (
     pgsync as pgsync_router, redpackets, responses, security as security_router,
     proxies, settings, stats, system, tokens, upstreams,
 )
-from .services import accountlog, cooling, dailyplan, pgsync, renew, tasklog, taskrun
+from .services import (
+    accountlog, cooling, dailyplan, pgsync, renew, tasklog, taskrun,
+    windows_install,
+)
 
 # 最早时刻把标准输出/错误钉成 UTF-8：Windows 中文区域默认按 cp936 编码，日志里
 # 一旦出现 emoji（账号昵称就可能带）就会抛 UnicodeEncodeError —— 与「成长任务」
@@ -32,6 +35,14 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config.ensure_dirs()
+    # Web 一键更新只重启服务，不再运行安装向导；在 Windows 上顺手刷新
+    # 「设置 → 应用」的版本号。只操作 InstallLocation 精确等于本目录的卸载项，
+    # 且失败不影响启动（包括非 Windows、开发目录和另一份安装）。
+    try:
+        if windows_install.refresh_uninstall_version():
+            logger.info('已刷新当前用户卸载项中的显示版本')
+    except Exception:  # noqa: BLE001
+        logger.warning('刷新 Windows 卸载项版本失败（不影响启动）', exc_info=True)
     db.connect()
     security.load_users()  # 首次启动会自动生成管理员并打印一次密码
     weak_admins = security.weak_admin_passwords()
@@ -101,7 +112,7 @@ def _warn_if_exposed() -> None:
 
 app = FastAPI(
     title='WorkBuddy Manager',
-    version='2.8.5',
+    version='2.8.6',
     lifespan=lifespan,
     # 生产环境默认关闭交互式文档与 OpenAPI 描述：
     # 它们会把管理接口全貌（路径、参数、结构）暴露给任何未认证访问者，

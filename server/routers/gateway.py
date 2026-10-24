@@ -15,7 +15,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import config, db, iputil, keysvc, upstreamsvc
-from ..services import modelcatalog, modelmap, proxyroutes
+from ..services import modelfallback, modelcatalog, modelmap, proxyroutes
 from ..config import _env_int
 from ..routers.security import get_config as get_security_config
 
@@ -25,7 +25,8 @@ router = APIRouter(tags=['gateway'])
 
 
 def _oai_error(message: str, status: int = 400, err_type: str = 'invalid_request_error',
-               code: str | None = None, hint: str | None = None) -> JSONResponse:
+               code: str | None = None, hint: str | None = None,
+               headers: Mapping[str, str] | None = None) -> JSONResponse:
     """OpenAI 形状的错误体。
 
     `hint` 对应上游 2026-09-16 新增的 `error.gateway_hint`：与 message **并列**的
@@ -39,7 +40,7 @@ def _oai_error(message: str, status: int = 400, err_type: str = 'invalid_request
     err: dict = {'message': message, 'type': err_type, 'code': code}
     if hint:
         err['gateway_hint'] = hint
-    return JSONResponse({'error': err}, status_code=status)
+    return JSONResponse({'error': err}, status_code=status, headers=headers)
 
 
 def _bearer(request: Request) -> str:
@@ -736,6 +737,17 @@ def _map_model(model: str | None) -> str | None:
     return modelmap.target_for(db.get_setting('model_map', {}) or {}, model)
 
 
+def _fallback_plan(primary: str | None, mapped: str | None, key: dict) -> list[str]:
+    """Resolve the bounded actual-model sequence for this request."""
+    return modelfallback.build_plan(
+        primary,
+        mapped,
+        table=db.get_setting('model_fallbacks', {}) or {},
+        key=key,
+        model_map=db.get_setting('model_map', {}) or {},
+    )
+
+
 def _upstream_headers(upstream: dict | None = None) -> dict:
     """转发时用的请求头；`upstream` 为空 = 默认上游。
 
@@ -1194,9 +1206,6 @@ async def _chat(request: Request, upstream_path: str):
     if err:
         return err
 
-    if mapped:
-        body['model'] = mapped
-
     # 越界的 max_tokens 会被上游包装成 503（见 clamp_max_tokens 的说明），
     # 鉴权后、转发前压回上限。
     clamp_max_tokens(body)
@@ -1217,51 +1226,169 @@ async def _chat(request: Request, upstream_path: str):
         return upstream_err
     url = f'{upstream["base_url"]}{upstream_path}'
     started = time.time()
+    scope = modelfallback.scope_for(
+        upstream["base_url"], upstreamsvc.forward_api_key(upstream),
+    )
+    raw_plan = _fallback_plan(requested_model, mapped, key)
+    if not raw_plan:
+        return _oai_error('model 不能为空', 400, 'invalid_request_error', 'invalid_model')
+    plan, cooldown_wait = modelfallback.available_plan(
+        raw_plan, scope,
+    )
+    if not plan:
+        message, headers = modelfallback.local_cooldown(
+            requested_model, cooldown_wait,
+        )
+        _record(
+            key, ip, requested_model or '', raw_plan[0], 429, 0, 0,
+            int((time.time() - started) * 1000), ua, message, stream,
+            reasoning_effort=effort, client_channel=channel,
+        )
+        return _oai_error(
+            message, 429, 'rate_limit_error', 'model_rate_limited',
+            headers=headers,
+        )
 
     if not stream:
-        try:
-            async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
-                resp = await client.post(url, json=body, headers=_upstream_headers(upstream))
+        for index, actual_model in enumerate(plan):
+            body['model'] = actual_model
+            try:
+                async with config.http_client(config.UPSTREAM_TIMEOUT, connect=5) as client:
+                    resp = await client.post(
+                        url, json=body, headers=_upstream_headers(upstream),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                latency = int((time.time() - started) * 1000)
+                _record(key, ip, requested_model or '', actual_model, 502, 0, 0,
+                        latency, ua, str(exc), False,
+                        reasoning_effort=effort, client_channel=channel)
+                return _oai_error(
+                    f'上游不可用: {exc}{_upstream_hint(upstream)}',
+                    502, 'api_error', 'upstream_unavailable',
+                )
+
             latency = int((time.time() - started) * 1000)
             usage = {}
             try:
                 data = resp.json()
                 usage = data.get('usage') or {}
-            except Exception:
+            except Exception:  # noqa: BLE001
                 data = None
+            raw_text = str(getattr(resp, 'text', '') or '')[:1000]
             pt = int(usage.get('prompt_tokens') or 0)
             ct = int(usage.get('completion_tokens') or 0)
-            error = None if resp.status_code < 400 else (str(data)[:500] if data is not None else resp.text[:500])
+            error = (
+                None if resp.status_code < 400
+                else (str(data)[:500] if data is not None else raw_text[:500])
+            )
             _record(
-                key, ip, requested_model or '', mapped or '', resp.status_code, pt, ct,
+                key, ip, requested_model or '', actual_model, resp.status_code, pt, ct,
                 latency, ua, error, False, usage=usage,
                 reasoning_effort=effort, client_channel=channel,
             )
+
+            fallback_trigger = modelfallback.is_fallback_trigger(
+                resp.status_code, data, raw_text,
+            )
+            if fallback_trigger:
+                modelfallback.note_exhausted(
+                    scope, actual_model, getattr(resp, 'headers', {}), data, raw_text,
+                    allow_default=index + 1 < len(plan),
+                )
+            if fallback_trigger and index + 1 < len(plan):
+                continue
             if data is not None:
-                return JSONResponse(data, status_code=resp.status_code)
-            return JSONResponse({'error': {'message': resp.text[:1000], 'type': 'api_error'}}, status_code=resp.status_code)
-        except Exception as exc:  # noqa: BLE001
-            latency = int((time.time() - started) * 1000)
-            _record(key, ip, requested_model or '', mapped or '', 502, 0, 0,
-                    latency, ua, str(exc), False,
-                    reasoning_effort=effort, client_channel=channel)
-            return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
+                headers = (
+                    modelfallback.failure_headers(
+                        getattr(resp, 'headers', {}), data, raw_text,
+                    )
+                    if resp.status_code >= 400 else None
+                )
+                return JSONResponse(
+                    data, status_code=resp.status_code, headers=headers,
+                )
+            headers = (
+                modelfallback.failure_headers(
+                    getattr(resp, 'headers', {}), None, raw_text,
+                )
+                if resp.status_code >= 400 else None
+            )
+            return JSONResponse(
+                {'error': {'message': raw_text, 'type': 'api_error'}},
+                status_code=resp.status_code,
+                headers=headers,
+            )
+        raise AssertionError('non-stream model plan must return')
 
     # 流式转发
-    client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
-    try:
-        req = client.build_request('POST', url, json=body, headers=_upstream_headers(upstream))
-        resp = await client.send(req, stream=True)
-    except Exception as exc:  # noqa: BLE001
-        await client.aclose()
-        latency = int((time.time() - started) * 1000)
-        _record(key, ip, requested_model or '', mapped or '', 502, 0, 0,
-                latency, ua, str(exc), True,
-                reasoning_effort=effort, client_channel=channel)
-        return _oai_error(f'上游不可用: {exc}' + _upstream_hint(upstream), 502, 'api_error', 'upstream_unavailable')
+    client = resp = None
+    status_code = 0
+    content_type = 'text/event-stream'
+    actual_model = plan[0]
+    for index, candidate_model in enumerate(plan):
+        actual_model = candidate_model
+        body['model'] = actual_model
+        client = config.http_client(config.UPSTREAM_TIMEOUT, connect=5)
+        try:
+            req = client.build_request(
+                'POST', url, json=body, headers=_upstream_headers(upstream),
+            )
+            resp = await client.send(req, stream=True)
+        except Exception as exc:  # noqa: BLE001
+            await client.aclose()
+            latency = int((time.time() - started) * 1000)
+            _record(key, ip, requested_model or '', actual_model, 502, 0, 0,
+                    latency, ua, str(exc), True,
+                    reasoning_effort=effort, client_channel=channel)
+            return _oai_error(
+                f'上游不可用: {exc}{_upstream_hint(upstream)}',
+                502, 'api_error', 'upstream_unavailable',
+            )
 
-    status_code = resp.status_code
-    content_type = resp.headers.get('content-type', 'text/event-stream')
+        status_code = resp.status_code
+        if status_code < 400:
+            content_type = getattr(resp, 'headers', {}).get(
+                'content-type', 'text/event-stream',
+            )
+            break
+
+        # Read the complete pre-stream error before emitting anything.  This is
+        # the only safe point at which the gateway may switch models.
+        raw = await modelfallback.read_error_body(resp)
+        try:
+            await resp.aclose()
+        finally:
+            await client.aclose()
+        raw_text = raw.decode('utf-8', errors='replace')[:1000]
+        try:
+            data = json.loads(raw_text)
+        except (TypeError, ValueError):
+            data = None
+        latency = int((time.time() - started) * 1000)
+        _record(
+            key, ip, requested_model or '', actual_model, status_code, 0, 0,
+            latency, ua, raw_text[:500], True,
+            reasoning_effort=effort, client_channel=channel,
+        )
+        fallback_trigger = modelfallback.is_fallback_trigger(
+            status_code, data, raw_text,
+        )
+        if fallback_trigger:
+            modelfallback.note_exhausted(
+                scope, actual_model, getattr(resp, 'headers', {}), data, raw_text,
+                allow_default=index + 1 < len(plan),
+            )
+        if fallback_trigger and index + 1 < len(plan):
+            continue
+        headers = modelfallback.failure_headers(
+            getattr(resp, 'headers', {}), data, raw_text,
+        )
+        payload = data if isinstance(data, dict) else {
+            'error': {'message': raw_text, 'type': 'api_error'},
+        }
+        return JSONResponse(payload, status_code=status_code, headers=headers)
+    else:
+        raise AssertionError('stream model plan must return')
 
     async def generator():
         usage: dict = {}
@@ -1294,7 +1421,7 @@ async def _chat(request: Request, upstream_path: str):
             pt = int(usage.get('prompt_tokens') or 0)
             ct = int(usage.get('completion_tokens') or 0)
             _record(
-                key, ip, requested_model or '', mapped or '', status_code, pt, ct,
+                key, ip, requested_model or '', actual_model, status_code, pt, ct,
                 latency, ua, error_text, True, usage=usage,
                 first_token=first_token_ms, reasoning_effort=effort,
                 client_channel=channel,

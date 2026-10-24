@@ -299,6 +299,7 @@ def _is_control_table(name: str) -> bool:
 #   · 以后新增的 key 默认不同步，需要显式加进来，避免静默泄露。
 _SETTING_ALLOWLIST = frozenset({
     'model_map',
+    'model_fallbacks',
     'daily_tasks_plan',
     'task_claim_schedule',
     'token_refresh_plan',
