@@ -4,7 +4,7 @@
 
 **腾讯 CodeBuddy 账号池管理控制台 · OpenAI 兼容反代网关**
 
-腾讯 CodeBuddy 账号池的 Web 管理端与 OpenAI 兼容反代网关：扫码纳管、定时签到与保活、密钥分发、IP 与模型白名单、日志与用量统计。项目在原始版本停更后由 AEmbers 接续维护，上游 Go 源码以补丁形式继续维护并随发布包分发（MIT）；迁移见[部署指南](deploy/README.md#〇上游源码从哪来随发布包分发)。
+腾讯 CodeBuddy 账号池的 Web 管理端与 OpenAI 兼容反代网关：扫码纳管、定时签到与保活、密钥分发、IP 与模型白名单、日志与用量统计。本项目是 AEmbers **独立维护的自用第三方 fork**：上游 [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) 由原作者**正常维护中**；上游尚未覆盖的改动，本仓库以自用补丁形式维护并随发布包分发（MIT）。迁移见[部署指南](deploy/README.md#〇上游源码从哪来随发布包分发)。
 
 ![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)
@@ -17,10 +17,11 @@
 
 [English](README.en.md) · **简体中文**
 
-> **维护状态**：这是 WorkBuddy Manager 的**社区延续版**，由 **AEmbers** 独立维护。
-> 原项目暂时停止更新后，本仓库继续提供面板、发布包、Windows 安装器、容器镜像和上游
-> 此fork版本源码补丁；此fork后续版本、Issue 与更新均以
-> [AEmbers/workbuddy-manager](https://github.com/AEmbers/workbuddy-manager) 为准。
+> **维护状态**：这是 WorkBuddy Manager 的**自用第三方 fork**，由 **AEmbers** 独立维护。
+> 上游 [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager)
+> 由原作者**正常维护中**，请优先使用上游版本；上游尚未覆盖到的改动，本仓库可能
+> 以自用补丁形式提供。此前 README 中"原项目停止更新、本仓库接续维护"的说法，是
+> 一次自动化助手误解用户意图产生的乌龙，特此更正并向上游作者致歉。
 
 <p align="center">
   <strong>⚠️ 使用边界：</strong>本项目只用于管理<strong>本人及亲属自愿授权</strong>的账号；禁止批量注册、账号交易、代注册、接码、盗号、绕过平台风控，以及任何商业转售或盈利性用途。使用即表示你已阅读并同意<a href="#使用边界与免责声明">完整免责声明</a>。
@@ -48,13 +49,14 @@ WorkBuddy Manager 是面向腾讯 CodeBuddy 账号池的自部署控制台与 Op
 | 无法知道谁用了多少 | 每次调用的模型、Token、延迟、来源 IP 全量留痕 |
 | 无任何 IP 防护 | 入站白/黑名单 + 每密钥 IP 上限与白名单 |
 
-**维护关系**：本项目在原始 WorkBuddy Manager 与 workbuddy2api 停止公开维护后接续
-开发。现在管理端、Go 上游补丁、Issue、Release、Windows 安装器和容器镜像都由
-AEmbers 维护。原始项目仅作为代码来源与 MIT 归属记录，不表示原作者仍在参与，
-也不表示双方存在赞助、认证或背书关系。
+**维护关系**：上游 [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager)
+与 workbuddy2api 由原作者**正常维护中**。本仓库是 AEmbers 的自用第三方 fork：
+面板、发布包、Windows 安装器和容器镜像的自用构建在此发布；上游没有覆盖到的改动
+会以补丁形式在本仓库维护。原始项目是代码来源与 MIT 归属记录，不表示双方存在
+赞助、认证或背书关系。
 
-欢迎参与共建；面板功能和随包上游源码的问题都提到
-[本仓库](https://github.com/AEmbers/workbuddy-manager/issues)。
+功能请求与问题反馈请优先提到[上游仓库](https://github.com/ithtelab/workbuddy-manager/issues)；
+仅涉及本 fork 自用改动的，再提到[本仓库](https://github.com/AEmbers/workbuddy-manager/issues)。
 
 ---
 
@@ -265,7 +267,7 @@ CI 会构建前端、打包产物、从 CHANGELOG 提取对应版本段落作为
 ## 致谢
 
 - [**linux-do/cdk**](https://github.com/linux-do/cdk)（MIT）—— 界面设计令牌与浮动底栏组件来源，本项目 UI 视觉与其保持一致
-- [**ithtelab/workbuddy-manager**](https://github.com/ithtelab/workbuddy-manager) —— 本项目延续的历史管理端（MIT，v2.8.3 后停止更新）
+- [**ithtelab/workbuddy-manager**](https://github.com/ithtelab/workbuddy-manager) —— 上游管理端（MIT，由原作者正常维护中）
 - [**Sliverkiss/workbuddy2api**](https://github.com/Sliverkiss/workbuddy2api) —— 底层账号池与 OpenAI 兼容代理（MIT；源码随本项目的发布包分发，版权归原作者）
 - [**lbjlaq/Antigravity-Manager**](https://github.com/lbjlaq/Antigravity-Manager) —— 管理端功能形态参考
 

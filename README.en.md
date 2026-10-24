@@ -4,7 +4,7 @@
 
 **Management console for Tencent CodeBuddy account pools · OpenAI-compatible gateway**
 
-A web console and OpenAI-compatible gateway for Tencent CodeBuddy account pools: QR onboarding, scheduled check-in and keep-alive, key distribution, IP and model allowlists, request logs and usage stats. After the original project stopped public maintenance, AEmbers continues development here; the upstream Go source is maintained as patches and ships inside the release package (MIT) — see the [deployment guide](deploy/README.md#〇上游源码从哪来随发布包分发) for migration.
+A web console and OpenAI-compatible gateway for Tencent CodeBuddy account pools: QR onboarding, scheduled check-in and keep-alive, key distribution, IP and model allowlists, request logs and usage stats. This is a **self-use third-party fork** maintained independently by AEmbers: the upstream [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) is **actively maintained by its original author**; changes not yet covered upstream are maintained here as self-use patches and ship inside the release package (MIT) — see the [deployment guide](deploy/README.md#〇上游源码从哪来随发布包分发) for migration.
 
 ![Next.js](https://img.shields.io/badge/Next.js-15-000000?logo=nextdotjs&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)
@@ -17,11 +17,14 @@ A web console and OpenAI-compatible gateway for Tencent CodeBuddy account pools:
 
 **English** · [简体中文](README.md)
 
-> **Maintenance status**: This is the **community continuation** of WorkBuddy
-> Manager, independently maintained by **AEmbers** after the original project
-> stopped updating. The console, release packages, Windows installer, container
-> images and upstream source patches are now maintained at
-> [AEmbers/workbuddy-manager](https://github.com/AEmbers/workbuddy-manager).
+> **Maintenance status**: This is a **self-use third-party fork** of WorkBuddy
+> Manager, maintained independently by **AEmbers**. The upstream
+> [ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager)
+> is **actively maintained by its original author** — prefer upstream. Changes
+> not yet covered upstream may be provided here as self-use patches. An earlier
+> claim in this README that the original project had stopped updating was a
+> mix-up caused by an automated assistant misunderstanding its instructions;
+> it is hereby corrected, with apologies to the upstream author.
 
 <p align="center">
   <strong>⚠️ Intended use:</strong> this project is only for managing accounts that <strong>you or your family members have voluntarily authorized</strong>. Bulk registration, account trading, registration-on-behalf, SMS-code farming, account theft, bypassing platform risk controls, resale, or any for-profit use are prohibited. By using this project you agree to the <a href="#intended-use--disclaimer">full disclaimer</a>.
@@ -50,15 +53,18 @@ and the upstream service together in one web interface:
 | No idea who consumed how much | Every call is logged: model, tokens, latency, source IP |
 | No IP protection at all | Inbound allow/deny lists plus per-key IP limits and allowlists |
 
-**Maintenance relationship**: this project continues development after the original
-WorkBuddy Manager and workbuddy2api stopped public maintenance. The console, Go upstream
-patches, issues, releases, Windows installer and container images are maintained by
-AEmbers. The historical projects are credited as code origins under MIT; this does not
-mean that their authors still participate or that either side sponsors, certifies or
-endorses this continuation.
+**Maintenance relationship**: the upstream
+[ithtelab/workbuddy-manager](https://github.com/ithtelab/workbuddy-manager) and
+workbuddy2api are **actively maintained by their original authors**. This repository is
+AEmbers' self-use third-party fork: self-use builds of the console, release packages,
+Windows installer and container images are published here, and changes not yet covered
+upstream are maintained as patches in this repository. The original projects are credited
+as code origins under MIT; neither side sponsors, certifies or endorses the other.
 
-Contributions are welcome; issues for both the console and bundled upstream source belong
-in [this repository](https://github.com/AEmbers/workbuddy-manager/issues).
+Feature requests and bug reports should go to the
+[upstream repository](https://github.com/ithtelab/workbuddy-manager/issues) first;
+only matters specific to this fork's self-use patches belong in
+[this repository](https://github.com/AEmbers/workbuddy-manager/issues).
 
 ---
 
@@ -263,7 +269,7 @@ release notes, and creates a Release with the archives attached.
 - [**linux-do/cdk**](https://github.com/linux-do/cdk) (MIT) — design tokens and floating
   dock component; this project's UI follows its visual language
 - [**ithtelab/workbuddy-manager**](https://github.com/ithtelab/workbuddy-manager) — the
-  predecessor console continued by this project (MIT; stopped after v2.8.3)
+  upstream console (MIT; actively maintained by its original author)
 - [**Sliverkiss/workbuddy2api**](https://github.com/Sliverkiss/workbuddy2api) — the account
   pool and OpenAI-compatible proxy underneath (MIT; its source is distributed with
   this project's releases)
