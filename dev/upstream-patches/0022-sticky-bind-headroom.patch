@@ -1,7 +1,16 @@
 diff --git a/cmd/server/main.go b/cmd/server/main.go
-index de1599c..59bd466 100644
+index de1599c..c376b44 100644
 --- a/cmd/server/main.go
 +++ b/cmd/server/main.go
+@@ -98,7 +98,7 @@ func main() {
+ 	} else {
+ 		log.Printf("未配置出口线路（config.json 的 proxies 段）：账号绑定的线路名会明确报错，不会静默直连")
+ 	}
+-	p.SetCreditExhausted(cfg.CreditExhaustedDur)       // 积分耗尽后的冷却时长（credit_exhausted，0 = 旧行为）               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
++	p.SetCreditExhausted(cfg.CreditExhaustedDur) // 积分耗尽后的冷却时长（credit_exhausted，0 = 旧行为）               // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+ 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+ 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
+ 
 @@ -119,6 +119,9 @@ func main() {
  			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏，
  			// 见 wiring.go）；裸名走 cn（现状零回归）。
@@ -13,7 +22,7 @@ index de1599c..59bd466 100644
  		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
  		sessRouter.StartGC()
 diff --git a/cmd/server/wiring.go b/cmd/server/wiring.go
-index a5efefb..c64e43e 100644
+index a5efefb..947d2f4 100644
 --- a/cmd/server/wiring.go
 +++ b/cmd/server/wiring.go
 @@ -3,6 +3,7 @@ package main
@@ -28,6 +37,8 @@ index a5efefb..c64e43e 100644
  		realm, bare := server.ResolveModel(model)
  		return p.AvailableUIDsForModelRealm(bare, realm)
  	}
+-}
+\ No newline at end of file
 +}
 +
 +// realmAwareBindProfiles 构造会话粘性首绑的画像闭包（realm 感知，口径与上面同一套
@@ -43,8 +54,7 @@ index a5efefb..c64e43e 100644
 +		}
 +		return out
 +	}
- }
-\ No newline at end of file
++}
 diff --git a/internal/pool/bindprofile.go b/internal/pool/bindprofile.go
 new file mode 100644
 index 0000000..cfb2401
@@ -119,7 +129,7 @@ index 0000000..cfb2401
 +}
 diff --git a/internal/session/bind_headroom_test.go b/internal/session/bind_headroom_test.go
 new file mode 100644
-index 0000000..0986209
+index 0000000..9a6e6b3
 --- /dev/null
 +++ b/internal/session/bind_headroom_test.go
 @@ -0,0 +1,132 @@
@@ -144,8 +154,8 @@ index 0000000..0986209
 +// 期望 a1=3(=容量，不超载)、a2=2、a3=1——质量优先但被容量封顶。
 +func TestHeadroomSpreadsByCapacity(t *testing.T) {
 +	r := New(Config{
-+		TTL:      time.Minute,
-+		Store:    newCountingStore(),
++		TTL:       time.Minute,
++		Store:     newCountingStore(),
 +		Available: func() []string { return []string{"a1", "a2", "a3"} },
 +		Profiles: profilesOf(
 +			BindProfile{UID: "a1", Capacity: 3, Quality: 1e9}, // 质量碾压
@@ -173,8 +183,8 @@ index 0000000..0986209
 +// TestHeadroomQualityDecidesTiedTier：容量并列（同水位层）时质量分决胜。
 +func TestHeadroomQualityDecidesTiedTier(t *testing.T) {
 +	r := New(Config{
-+		TTL:      time.Minute,
-+		Store:    newCountingStore(),
++		TTL:       time.Minute,
++		Store:     newCountingStore(),
 +		Available: func() []string { return []string{"a1", "a2"} },
 +		Profiles: profilesOf(
 +			BindProfile{UID: "a1", Capacity: 8, Quality: 1e9},
@@ -192,8 +202,8 @@ index 0000000..0986209
 +// ——质量不允许牺牲一个会话槽位。
 +func TestHeadroomToleranceExcludesOverloaded(t *testing.T) {
 +	r := New(Config{
-+		TTL:      time.Minute,
-+		Store:    newCountingStore(),
++		TTL:       time.Minute,
++		Store:     newCountingStore(),
 +		Available: func() []string { return []string{"a1", "a2"} },
 +		Profiles: profilesOf(
 +			BindProfile{UID: "a1", Capacity: 8, Quality: 1e9},
@@ -236,8 +246,8 @@ index 0000000..0986209
 +// ——旧会话不该永远压低该号余量。
 +func TestHeadroomCountsOnlyActiveBindings(t *testing.T) {
 +	r := New(Config{
-+		TTL:      10 * time.Millisecond,
-+		Store:    newCountingStore(),
++		TTL:       10 * time.Millisecond,
++		Store:     newCountingStore(),
 +		Available: func() []string { return []string{"a1", "a2"} },
 +		Profiles: profilesOf(
 +			BindProfile{UID: "a1", Capacity: 2, Quality: 1e9},
@@ -256,7 +266,7 @@ index 0000000..0986209
 +	}
 +}
 diff --git a/internal/session/session.go b/internal/session/session.go
-index 2e238fb..868f7cf 100644
+index 2e238fb..c9a67a0 100644
 --- a/internal/session/session.go
 +++ b/internal/session/session.go
 @@ -4,7 +4,8 @@
@@ -454,3 +464,18 @@ index 2e238fb..868f7cf 100644
  // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
  func (r *Router) touch(key, uid string, now time.Time) {
  	r.mu.Lock()
+@@ -305,11 +421,11 @@ func hashIndex(key string, n int) int {
+ //  5. prompt_cache_key（第 5 项，见下）
+ //
+ // 前四项均为 conversation 维度（对话级）。metadata.user_id 不再作为粘性键
+-//（P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
++// （P1-anti-monopoly 剔除，issue118-deep-review §3）：user 维度粒度过粗——一个
+ // user 的全部并行对话会钉同一账号（粘性范围远大于上游 prompt cache 的对话级边界），
+ // 且曾抢占顶层 conversation_id 的优先级。剔除后发 user_id 的客户端回落加权轮换
+-//（与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
+-//（7d 兜底）自然过期，键消失不产生脏绑定。
++// （与无标识客户端同路径），旧 user_id 绑定靠 TTL（30m 滚动）与 Redis 镜像 TTL
++// （7d 兜底）自然过期，键消失不产生脏绑定。
+ //
+ // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
+ // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
